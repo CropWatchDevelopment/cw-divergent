@@ -10,6 +10,7 @@
 
 #include <stdbool.h>
 
+
 //bool hasBothSHT4xSensors(I2C_HandleTypeDef *hi2c);
 
 #endif /* SRC_SENSORS_SENSOR_DATA_H_ */
