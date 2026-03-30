@@ -10,7 +10,7 @@
 #define SLEEP_MANAGER_SECONDS_PER_MINUTE     60U
 #define SLEEP_MANAGER_WAKE_CYCLES_PER_MINUTE \
   (SLEEP_MANAGER_SECONDS_PER_MINUTE / SLEEP_MANAGER_WAKE_INTERVAL_S)
-#define SLEEP_MANAGER_GPIOA_KEEP_MASK        (DBG_LED_Pin | GPIO_PIN_13 | GPIO_PIN_14)
+#define SLEEP_MANAGER_GPIOA_KEEP_MASK        (DBG_LED_Pin | PULSE_IN_Pin | GPIO_PIN_13 | GPIO_PIN_14)
 #define SLEEP_MANAGER_GPIOB_KEEP_MASK        I2C_ENABLE_Pin
 #define SLEEP_MANAGER_GPIOC_KEEP_MASK        (WD_DONE_Pin | GPIO_PIN_14 | GPIO_PIN_15)
 
@@ -30,10 +30,13 @@ typedef struct
   IWDG_HandleTypeDef *iwdg;
   I2C_HandleTypeDef *i2c;
   volatile uint8_t wake_pending;
+  volatile uint8_t external_wake_pending;
   volatile uint8_t lse_fault_pending;
   uint8_t lsi_wakeup_cycles;
   uint8_t initialized;
   SleepManagerRtcSource active_rtc_source;
+  uint32_t cadence_cycles_total;
+  uint32_t cadence_cycles_remaining;
 } SleepManagerState;
 
 static SleepManagerState sleep_manager = {0};
@@ -392,8 +395,11 @@ void SleepManager_Init(RTC_HandleTypeDef *rtc, IWDG_HandleTypeDef *iwdg,
   sleep_manager.i2c = i2c;
 
   sleep_manager.wake_pending = 0U;
+  sleep_manager.external_wake_pending = 0U;
   sleep_manager.lse_fault_pending = 0U;
   sleep_manager.lsi_wakeup_cycles = 0U;
+  sleep_manager.cadence_cycles_total = 0U;
+  sleep_manager.cadence_cycles_remaining = 0U;
 
   sleep_manager_configure_run_clocks();
   sleep_manager_init_watchdog();
@@ -429,6 +435,7 @@ static void sleep_manager_wait_for_next_wake(void)
   for (;;)
   {
     bool handled_lse_fault = false;
+    bool woke_from_external = false;
 
     if (sleep_manager.lse_fault_pending != 0U)
     {
@@ -437,6 +444,7 @@ static void sleep_manager_wait_for_next_wake(void)
     }
 
     sleep_manager.wake_pending = 0U;
+    sleep_manager.external_wake_pending = 0U;
     __HAL_PWR_CLEAR_FLAG(PWR_FLAG_WU);
 
     HAL_SuspendTick();
@@ -454,12 +462,16 @@ static void sleep_manager_wait_for_next_wake(void)
       handled_lse_fault = true;
     }
 
-    if (sleep_manager.wake_pending == 0U)
+    if ((sleep_manager.wake_pending == 0U) &&
+        (sleep_manager.external_wake_pending == 0U))
     {
       continue;
     }
 
-    if ((sleep_manager.active_rtc_source == SLEEP_MANAGER_RTC_SOURCE_LSI) &&
+    woke_from_external = (sleep_manager.external_wake_pending != 0U);
+
+    if ((woke_from_external == false) &&
+        (sleep_manager.active_rtc_source == SLEEP_MANAGER_RTC_SOURCE_LSI) &&
         (handled_lse_fault == false))
     {
       sleep_manager.lsi_wakeup_cycles++;
@@ -479,7 +491,7 @@ static void sleep_manager_wait_for_next_wake(void)
 
 void SleepManager_SleepUntilWake(uint32_t sleep_minutes)
 {
-  uint32_t remaining_cycles;
+  uint32_t requested_cycles;
 
   if (sleep_minutes == 0U)
   {
@@ -491,12 +503,24 @@ void SleepManager_SleepUntilWake(uint32_t sleep_minutes)
     Error_Handler();
   }
 
-  remaining_cycles = sleep_minutes * SLEEP_MANAGER_WAKE_CYCLES_PER_MINUTE;
+  requested_cycles = sleep_minutes * SLEEP_MANAGER_WAKE_CYCLES_PER_MINUTE;
+  if ((sleep_manager.cadence_cycles_total != requested_cycles) ||
+      (sleep_manager.cadence_cycles_remaining == 0U))
+  {
+    sleep_manager.cadence_cycles_total = requested_cycles;
+    sleep_manager.cadence_cycles_remaining = requested_cycles;
+  }
+
   sleep_manager_prepare_board_for_sleep();
-  while (remaining_cycles > 0U)
+  while (sleep_manager.cadence_cycles_remaining > 0U)
   {
     sleep_manager_wait_for_next_wake();
-    remaining_cycles--;
+    if (sleep_manager.external_wake_pending != 0U)
+    {
+      sleep_manager.external_wake_pending = 0U;
+      break;
+    }
+    sleep_manager.cadence_cycles_remaining--;
   }
   sleep_manager_restore_board_after_sleep();
 }
@@ -512,6 +536,11 @@ void SleepManager_FeedWatchdog(void)
 void SleepManager_HandleRtcInterrupt(void)
 {
   HAL_RCCEx_LSECSS_IRQHandler();
+}
+
+void SleepManager_HandleExternalWake(void)
+{
+  sleep_manager.external_wake_pending = 1U;
 }
 
 void HAL_RTCEx_WakeUpTimerEventCallback(RTC_HandleTypeDef *hrtc)

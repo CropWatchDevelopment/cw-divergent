@@ -36,6 +36,7 @@
 #define APP_SLEEP_MINUTES_PER_SLOT                10U
 #define APP_INITIAL_SEND_RETRY_DELAY_MS           1000U
 #define APP_SENSOR_POWER_UP_DELAY_MS              300U
+#define APP_PULSE_DEBOUNCE_MS                     50U
 #define APP_SENSOR_TEMP_DELTA_LIMIT_MDEG_C        500
 #define APP_SENSOR_HUMIDITY_DELTA_LIMIT_MPCT_RH   5000
 
@@ -82,6 +83,10 @@ static const RM126xConfig g_rm126x_config = {
 };
 static uint8_t g_reset_reason_code = 0U;
 static bool g_initial_send_pending = false;
+static volatile uint32_t g_pulse_counter = 0;
+static volatile bool g_pulse_uplink_pending = false;
+static uint32_t g_last_pulse_tick_ms = 0U;
+static bool g_pulse_debounce_armed = false;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -104,6 +109,7 @@ static void App_BuildNormalPayload(const SensorDataSnapshot* snapshot,
 static void App_BuildDiagnosticPayload(const SensorDataSnapshot* snapshot,
                                        uint8_t reset_reason_code,
                                        uint8_t* payload);
+static void App_BuildPulseCountPayload(uint32_t pulse_count, uint8_t* payload);
 static void App_BuildMismatchPayload(const SensorDataSnapshot* snapshot,
                                      uint8_t* payload);
 static void App_BuildErrorPayload(uint8_t error_code, uint8_t* payload);
@@ -185,6 +191,10 @@ static void App_BuildDiagnosticPayload(const SensorDataSnapshot* snapshot,
   payload[8] = reset_reason_code;
 }
 
+static void App_BuildPulseCountPayload(uint32_t pulse_count, uint8_t* payload) {
+  App_PackU32BE(payload, pulse_count);
+}
+
 static void App_BuildMismatchPayload(const SensorDataSnapshot* snapshot,
                                      uint8_t* payload) {
   const SensorDataSensor* sensor1 = &snapshot->sensors[0];
@@ -217,6 +227,29 @@ static uint8_t App_SelectErrorCode(const SensorDataSnapshot* snapshot) {
   }
 
   return APP_ERROR_NO_SENSOR;
+}
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  if (GPIO_Pin == PULSE_IN_Pin) {
+    uint32_t now = HAL_GetTick();
+
+    if (g_pulse_debounce_armed &&
+        ((uint32_t)(now - g_last_pulse_tick_ms) < APP_PULSE_DEBOUNCE_MS)) {
+      return;
+    }
+
+    g_last_pulse_tick_ms = now;
+    g_pulse_debounce_armed = true;
+    SleepManager_HandleExternalWake();
+    g_pulse_uplink_pending = true;
+
+    if (g_pulse_counter == UINT32_MAX) {
+      g_pulse_counter = 0U;
+    } else {
+      g_pulse_counter++;
+    }
+  }
 }
 
 /* USER CODE END 0 */
@@ -279,6 +312,8 @@ int main(void)
       size_t tx_length = 0U;
       uint8_t tx_port = RM126X_FPORT_NORMAL;
       bool force_diagnostic = RM126x_ShouldSendDiagnosticPort9(&g_rm126x);
+      bool pulse_uplink_pending = g_pulse_uplink_pending;
+      uint32_t pulse_count_snapshot = g_pulse_counter;
       bool sensor1_valid;
       bool sensor2_valid;
       int32_t humidity_delta;
@@ -325,6 +360,12 @@ int main(void)
         App_BuildNormalPayload(&g_sensor_snapshot, tx_payload);
       }
 
+      if (!force_diagnostic && !g_initial_send_pending && pulse_uplink_pending) {
+        tx_port = RM126X_FPORT_PULSE_COUNT;
+        tx_length = 4U;
+        App_BuildPulseCountPayload(pulse_count_snapshot, tx_payload);
+      }
+
       HAL_GPIO_WritePin(I2C_ENABLE_GPIO_Port, I2C_ENABLE_Pin, GPIO_PIN_RESET);
 
       if (RM126x_WakeAndPing(&g_rm126x) == RM126X_RESULT_OK) {
@@ -337,6 +378,9 @@ int main(void)
         if (g_rm126x.current_fport == tx_port) {
           send_result = RM126x_SendBytes(&g_rm126x, tx_payload, tx_length);
           if (send_result == RM126X_RESULT_OK) {
+            if (tx_port == RM126X_FPORT_PULSE_COUNT) {
+              g_pulse_uplink_pending = false;
+            }
             g_initial_send_pending = false;
           }
         }
@@ -614,6 +658,12 @@ static void MX_GPIO_Init(void)
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(I2C_ENABLE_GPIO_Port, I2C_ENABLE_Pin, GPIO_PIN_RESET);
 
+  /*Configure GPIO pin : PULSE_IN_Pin */
+  GPIO_InitStruct.Pin = PULSE_IN_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(PULSE_IN_GPIO_Port, &GPIO_InitStruct);
+
   /*Configure GPIO pin : DBG_LED_Pin */
   GPIO_InitStruct.Pin = DBG_LED_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
@@ -634,6 +684,10 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_PULLDOWN;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
   HAL_GPIO_Init(I2C_ENABLE_GPIO_Port, &GPIO_InitStruct);
+
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI0_1_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI0_1_IRQn);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 

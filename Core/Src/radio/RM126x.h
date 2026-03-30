@@ -22,6 +22,7 @@ extern "C" {
 #define RM126X_MAX_SEND_PAYLOAD_BYTES       96U
 
 #define RM126X_FPORT_NORMAL                 1U
+#define RM126X_FPORT_PULSE_COUNT            3U
 #define RM126X_FPORT_DIAGNOSTIC             9U
 #define RM126X_FPORT_ERROR                  10U
 #define RM126X_FPORT_SENSOR_MISMATCH        11U

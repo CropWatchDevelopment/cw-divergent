@@ -22,6 +22,9 @@ void SleepManager_FeedWatchdog(void);
 /* Call from `RTC_IRQHandler()` inside `USER CODE BEGIN RTC_IRQn 0`. */
 void SleepManager_HandleRtcInterrupt(void);
 
+/* Call from a GPIO EXTI callback/IRQ that should wake the application from STOP. */
+void SleepManager_HandleExternalWake(void);
+
 #ifdef __cplusplus
 }
 #endif
