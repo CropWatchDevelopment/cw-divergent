@@ -22,6 +22,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "Sensors/sensor_data.h"
+#include "radio/RM126x.h"
 #include "sleep_manager.h"
 /* USER CODE END Includes */
 
@@ -32,6 +33,15 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define APP_SLEEP_MINUTES_PER_SLOT                10U
+#define APP_SENSOR_POWER_UP_DELAY_MS              300U
+#define APP_SENSOR_TEMP_DELTA_LIMIT_MDEG_C        500
+#define APP_SENSOR_HUMIDITY_DELTA_LIMIT_MPCT_RH   5000
+
+#define APP_ERROR_NO_SENSOR                       0x01U
+#define APP_ERROR_SENSOR1_FAILURE                 0x02U
+#define APP_ERROR_SENSOR2_FAILURE                 0x03U
+#define APP_ERROR_HUMIDITY_VALIDATION             0x05U
 
 /* USER CODE END PD */
 
@@ -47,9 +57,29 @@ IWDG_HandleTypeDef hiwdg;
 
 RTC_HandleTypeDef hrtc;
 
+UART_HandleTypeDef huart2;
+
 /* USER CODE BEGIN PV */
 static SensorDataSnapshot g_sensor_snapshot;
 static SensorDataStatus g_sensor_status = SENSOR_DATA_STATUS_NO_SENSORS;
+static RM126xHandle g_rm126x;
+static const RM126xConfig g_rm126x_config = {
+    .uart = {
+        .instance = USART2,
+        .tx_port = GPIOA,
+        .tx_pin = GPIO_PIN_2,
+        .tx_af = GPIO_AF4_USART2,
+        .rx_port = GPIOA,
+        .rx_pin = GPIO_PIN_3,
+        .rx_af = GPIO_AF4_USART2,
+        .baud_rate = RM126X_DEFAULT_BAUD_RATE,
+        .kernel_clock_hz = HSI_VALUE,
+    },
+    .wake_timeout_ms = RM126X_DEFAULT_WAKE_TIMEOUT_MS,
+    .command_timeout_ms = RM126X_DEFAULT_COMMAND_TIMEOUT_MS,
+    .rx_poll_timeout_ms = RM126X_DEFAULT_RX_POLL_TIMEOUT_MS,
+};
+static uint8_t g_reset_reason_code = 0U;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -58,11 +88,134 @@ static void MX_GPIO_Init(void);
 static void MX_RTC_Init(void);
 static void MX_IWDG_Init(void);
 static void MX_I2C1_Init(void);
+static void MX_USART2_UART_Init(void);
 /* USER CODE BEGIN PFP */
+static uint8_t App_CaptureResetReasonCode(void);
+static bool App_IsSensorValid(const SensorDataSensor* sensor);
+static void App_PackU16BE(uint8_t* buffer, uint16_t value);
+static void App_PackU32BE(uint8_t* buffer, uint32_t value);
+static uint16_t App_HumidityToWire(int32_t humidity_milli_pct_rh);
+static int16_t App_T1TemperatureToWire(int32_t temperature_mdeg_c);
+static int16_t App_T2TemperatureToWire(int32_t temperature_mdeg_c);
+static void App_BuildNormalPayload(const SensorDataSnapshot* snapshot,
+                                   uint8_t* payload);
+static void App_BuildDiagnosticPayload(const SensorDataSnapshot* snapshot,
+                                       uint8_t reset_reason_code,
+                                       uint8_t* payload);
+static void App_BuildMismatchPayload(const SensorDataSnapshot* snapshot,
+                                     uint8_t* payload);
+static void App_BuildErrorPayload(uint8_t error_code, uint8_t* payload);
+static uint8_t App_SelectErrorCode(const SensorDataSnapshot* snapshot);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static uint8_t App_CaptureResetReasonCode(void) {
+  uint8_t reset_reason = 0U;
+
+  if (__HAL_RCC_GET_FLAG(RCC_FLAG_IWDGRST) != RESET) {
+    reset_reason = 0x04U;
+  } else if (__HAL_RCC_GET_FLAG(RCC_FLAG_WWDGRST) != RESET) {
+    reset_reason = 0x05U;
+  } else if (__HAL_RCC_GET_FLAG(RCC_FLAG_SFTRST) != RESET) {
+    reset_reason = 0x03U;
+  } else if (__HAL_RCC_GET_FLAG(RCC_FLAG_LPWRRST) != RESET) {
+    reset_reason = 0x06U;
+  } else if (__HAL_RCC_GET_FLAG(RCC_FLAG_PINRST) != RESET) {
+    reset_reason = 0x01U;
+  } else if ((__HAL_RCC_GET_FLAG(RCC_FLAG_PORRST) != RESET) ||
+             (__HAL_RCC_GET_FLAG(RCC_FLAG_OBLRST) != RESET)) {
+    reset_reason = 0x02U;
+  }
+
+  __HAL_RCC_CLEAR_RESET_FLAGS();
+  return reset_reason;
+}
+
+static bool App_IsSensorValid(const SensorDataSensor* sensor) {
+  return (sensor != NULL) && sensor->present && (sensor->driver_error == 0);
+}
+
+static void App_PackU16BE(uint8_t* buffer, uint16_t value) {
+  buffer[0] = (uint8_t)((value >> 8) & 0xFFU);
+  buffer[1] = (uint8_t)(value & 0xFFU);
+}
+
+static void App_PackU32BE(uint8_t* buffer, uint32_t value) {
+  buffer[0] = (uint8_t)((value >> 24) & 0xFFU);
+  buffer[1] = (uint8_t)((value >> 16) & 0xFFU);
+  buffer[2] = (uint8_t)((value >> 8) & 0xFFU);
+  buffer[3] = (uint8_t)(value & 0xFFU);
+}
+
+static uint16_t App_HumidityToWire(int32_t humidity_milli_pct_rh) {
+  if (humidity_milli_pct_rh < 0) {
+    return 0U;
+  }
+
+  if (humidity_milli_pct_rh > 100000) {
+    return 10000U;
+  }
+
+  return (uint16_t)(humidity_milli_pct_rh / 10);
+}
+
+static int16_t App_T1TemperatureToWire(int32_t temperature_mdeg_c) {
+  return (int16_t)((temperature_mdeg_c / 10) + 5500);
+}
+
+static int16_t App_T2TemperatureToWire(int32_t temperature_mdeg_c) {
+  return (int16_t)(temperature_mdeg_c / 10);
+}
+
+static void App_BuildNormalPayload(const SensorDataSnapshot* snapshot,
+                                   uint8_t* payload) {
+  const SensorDataSensor* sensor1 = &snapshot->sensors[0];
+  App_PackU16BE(payload, (uint16_t)App_T1TemperatureToWire(sensor1->temperature_mdeg_c));
+  App_PackU16BE(payload + 2, App_HumidityToWire(sensor1->humidity_milli_pct_rh));
+}
+
+static void App_BuildDiagnosticPayload(const SensorDataSnapshot* snapshot,
+                                       uint8_t reset_reason_code,
+                                       uint8_t* payload) {
+  App_PackU32BE(payload, snapshot->sensors[0].serial_number);
+  App_PackU32BE(payload + 4, snapshot->sensors[1].serial_number);
+  payload[8] = reset_reason_code;
+}
+
+static void App_BuildMismatchPayload(const SensorDataSnapshot* snapshot,
+                                     uint8_t* payload) {
+  const SensorDataSensor* sensor1 = &snapshot->sensors[0];
+  const SensorDataSensor* sensor2 = &snapshot->sensors[1];
+
+  App_PackU16BE(payload, (uint16_t)App_T1TemperatureToWire(sensor1->temperature_mdeg_c));
+  App_PackU16BE(payload + 2, App_HumidityToWire(sensor1->humidity_milli_pct_rh));
+  App_PackU16BE(payload + 4, (uint16_t)App_T2TemperatureToWire(sensor2->temperature_mdeg_c));
+  App_PackU16BE(payload + 6, App_HumidityToWire(sensor2->humidity_milli_pct_rh));
+}
+
+static void App_BuildErrorPayload(uint8_t error_code, uint8_t* payload) {
+  payload[0] = error_code;
+}
+
+static uint8_t App_SelectErrorCode(const SensorDataSnapshot* snapshot) {
+  bool sensor1_valid = App_IsSensorValid(&snapshot->sensors[0]);
+  bool sensor2_valid = App_IsSensorValid(&snapshot->sensors[1]);
+
+  if (!sensor1_valid && !sensor2_valid) {
+    return APP_ERROR_NO_SENSOR;
+  }
+
+  if (!sensor1_valid) {
+    return APP_ERROR_SENSOR1_FAILURE;
+  }
+
+  if (!sensor2_valid) {
+    return APP_ERROR_SENSOR2_FAILURE;
+  }
+
+  return APP_ERROR_NO_SENSOR;
+}
 
 /* USER CODE END 0 */
 
@@ -83,6 +236,7 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
+  g_reset_reason_code = App_CaptureResetReasonCode();
 
   /* USER CODE END Init */
 
@@ -98,10 +252,13 @@ int main(void)
   MX_RTC_Init();
   MX_IWDG_Init();
   MX_I2C1_Init();
+  MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
   /* Sleep manager owns the final RTC/IWDG configuration after CubeMX init. */
   SleepManager_Init(&hrtc, &hiwdg, &hi2c1);
   SensorData_Init(&hi2c1);
+  RM126x_Init(&g_rm126x, &g_rm126x_config);
+  (void)RM126x_HostUartResume(&g_rm126x);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -111,16 +268,81 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	HAL_GPIO_WritePin(WD_DONE_GPIO_Port, WD_DONE_Pin, GPIO_PIN_SET); // Feeds the hardware watchdog
-	HAL_GPIO_WritePin(I2C_ENABLE_GPIO_Port, I2C_ENABLE_Pin, GPIO_PIN_SET);
-	HAL_Delay(300); // DONE Minimum DONE pulse width (5) 100 nS & 300ms is the min time to power i2c line
-	g_sensor_status = SensorData_ReadAll(&g_sensor_snapshot);
+    HAL_GPIO_WritePin(WD_DONE_GPIO_Port, WD_DONE_Pin, GPIO_PIN_SET);
+    (void)RM126x_HostUartResume(&g_rm126x);
 
+    if (RM126x_IsConnected(&g_rm126x)) {
+      uint8_t tx_payload[9] = {0};
+      size_t tx_length = 0U;
+      uint8_t tx_port = RM126X_FPORT_NORMAL;
+      bool force_diagnostic = RM126x_ShouldSendDiagnosticPort9(&g_rm126x);
+      bool sensor1_valid;
+      bool sensor2_valid;
+      int32_t humidity_delta;
+      int32_t temperature_delta;
 
-	HAL_GPIO_WritePin(WD_DONE_GPIO_Port, WD_DONE_Pin, GPIO_PIN_RESET);
-	HAL_GPIO_WritePin(I2C_ENABLE_GPIO_Port, I2C_ENABLE_Pin, GPIO_PIN_RESET);
+      HAL_GPIO_WritePin(I2C_ENABLE_GPIO_Port, I2C_ENABLE_Pin, GPIO_PIN_SET);
+      HAL_Delay(APP_SENSOR_POWER_UP_DELAY_MS);
+      g_sensor_status = SensorData_ReadAll(&g_sensor_snapshot);
+      sensor1_valid = App_IsSensorValid(&g_sensor_snapshot.sensors[0]);
+      sensor2_valid = App_IsSensorValid(&g_sensor_snapshot.sensors[1]);
+      humidity_delta = g_sensor_snapshot.sensors[0].humidity_milli_pct_rh -
+                       g_sensor_snapshot.sensors[1].humidity_milli_pct_rh;
+      if (humidity_delta < 0) {
+        humidity_delta = -humidity_delta;
+      }
+      temperature_delta = g_sensor_snapshot.sensors[0].temperature_mdeg_c -
+                          g_sensor_snapshot.sensors[1].temperature_mdeg_c;
+      if (temperature_delta < 0) {
+        temperature_delta = -temperature_delta;
+      }
 
-    SleepManager_SleepUntilWake(1U);
+      if (force_diagnostic) {
+        tx_port = RM126X_FPORT_DIAGNOSTIC;
+        tx_length = 9U;
+        App_BuildDiagnosticPayload(&g_sensor_snapshot, g_reset_reason_code,
+                                   tx_payload);
+      } else if (!sensor1_valid || !sensor2_valid ||
+                 (g_sensor_status == SENSOR_DATA_STATUS_NO_SENSORS)) {
+        tx_port = RM126X_FPORT_ERROR;
+        tx_length = 1U;
+        App_BuildErrorPayload(App_SelectErrorCode(&g_sensor_snapshot),
+                              tx_payload);
+      } else if (temperature_delta > APP_SENSOR_TEMP_DELTA_LIMIT_MDEG_C) {
+        tx_port = RM126X_FPORT_SENSOR_MISMATCH;
+        tx_length = 8U;
+        App_BuildMismatchPayload(&g_sensor_snapshot, tx_payload);
+      } else if (humidity_delta > APP_SENSOR_HUMIDITY_DELTA_LIMIT_MPCT_RH) {
+        tx_port = RM126X_FPORT_ERROR;
+        tx_length = 1U;
+        App_BuildErrorPayload(APP_ERROR_HUMIDITY_VALIDATION, tx_payload);
+      } else {
+        tx_port = RM126X_FPORT_NORMAL;
+        tx_length = 4U;
+        App_BuildNormalPayload(&g_sensor_snapshot, tx_payload);
+      }
+
+      HAL_GPIO_WritePin(I2C_ENABLE_GPIO_Port, I2C_ENABLE_Pin, GPIO_PIN_RESET);
+
+      if (RM126x_WakeAndPing(&g_rm126x) == RM126X_RESULT_OK) {
+        if (g_rm126x.current_fport != tx_port) {
+          (void)RM126x_SetFPort(&g_rm126x, tx_port);
+        }
+
+        if (g_rm126x.current_fport == tx_port) {
+          (void)RM126x_SendBytes(&g_rm126x, tx_payload, tx_length);
+        }
+      }
+    } else {
+      (void)RM126x_Join(&g_rm126x);
+      HAL_GPIO_WritePin(I2C_ENABLE_GPIO_Port, I2C_ENABLE_Pin, GPIO_PIN_RESET);
+    }
+
+    (void)RM126x_HostUartSuspend(&g_rm126x);
+    HAL_GPIO_WritePin(WD_DONE_GPIO_Port, WD_DONE_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(I2C_ENABLE_GPIO_Port, I2C_ENABLE_Pin, GPIO_PIN_RESET);
+
+    SleepManager_SleepUntilWake(APP_SLEEP_MINUTES_PER_SLOT);
 
     /* USER APP CODE BEGIN */
     /* Caller owns I2C_ENABLE. Power the sensors, wait
@@ -155,13 +377,13 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_LSI|RCC_OSCILLATORTYPE_LSE
-                              |RCC_OSCILLATORTYPE_MSI|RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI|RCC_OSCILLATORTYPE_LSI
+                              |RCC_OSCILLATORTYPE_LSE|RCC_OSCILLATORTYPE_MSI;
   RCC_OscInitStruct.LSEState = RCC_LSE_ON;
-  RCC_OscInitStruct.LSIState = RCC_LSI_ON;
-  RCC_OscInitStruct.MSIState = RCC_MSI_ON;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.LSIState = RCC_LSI_ON;
+  RCC_OscInitStruct.MSIState = RCC_MSI_ON;
   RCC_OscInitStruct.MSICalibrationValue = 0;
   RCC_OscInitStruct.MSIClockRange = RCC_MSIRANGE_5;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
@@ -183,7 +405,9 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
-  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_I2C1|RCC_PERIPHCLK_RTC;
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_USART2|RCC_PERIPHCLK_I2C1
+                              |RCC_PERIPHCLK_RTC;
+  PeriphClkInit.Usart2ClockSelection = RCC_USART2CLKSOURCE_PCLK1;
   PeriphClkInit.I2c1ClockSelection = RCC_I2C1CLKSOURCE_HSI;
   PeriphClkInit.RTCClockSelection = RCC_RTCCLKSOURCE_LSE;
   if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
@@ -212,7 +436,6 @@ static void MX_I2C1_Init(void)
 
   /* USER CODE END I2C1_Init 1 */
   hi2c1.Instance = I2C1;
-  /* ES0292 section 2.12.3: run I2C1 from HSI16 with CubeMX timing for STM32L073. */
   hi2c1.Init.Timing = 0x00503D58;
   hi2c1.Init.OwnAddress1 = 0;
   hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
@@ -314,6 +537,41 @@ static void MX_RTC_Init(void)
   /* USER CODE BEGIN RTC_Init 2 */
 
   /* USER CODE END RTC_Init 2 */
+
+}
+
+/**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART2_Init 0 */
+
+  /* USER CODE END USART2_Init 0 */
+
+  /* USER CODE BEGIN USART2_Init 1 */
+
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 9600;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART2_Init 2 */
+
+  /* USER CODE END USART2_Init 2 */
 
 }
 
