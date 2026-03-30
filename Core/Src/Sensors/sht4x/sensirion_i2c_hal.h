@@ -33,10 +33,13 @@
 #define SENSIRION_I2C_HAL_H
 
 #include "sensirion_config.h"
+#include "stm32l0xx_hal.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif /* __cplusplus */
+
+void sensirion_i2c_hal_set_handle(I2C_HandleTypeDef* hi2c);
 
 /**
  * Select the current i2c bus by index.
