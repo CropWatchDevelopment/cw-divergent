@@ -34,6 +34,7 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define APP_SLEEP_MINUTES_PER_SLOT                10U
+#define APP_INITIAL_SEND_RETRY_DELAY_MS           1000U
 #define APP_SENSOR_POWER_UP_DELAY_MS              300U
 #define APP_SENSOR_TEMP_DELTA_LIMIT_MDEG_C        500
 #define APP_SENSOR_HUMIDITY_DELTA_LIMIT_MPCT_RH   5000
@@ -80,6 +81,7 @@ static const RM126xConfig g_rm126x_config = {
     .rx_poll_timeout_ms = RM126X_DEFAULT_RX_POLL_TIMEOUT_MS,
 };
 static uint8_t g_reset_reason_code = 0U;
+static bool g_initial_send_pending = false;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -237,6 +239,7 @@ int main(void)
 
   /* USER CODE BEGIN Init */
   g_reset_reason_code = App_CaptureResetReasonCode();
+  g_initial_send_pending = true;
 
   /* USER CODE END Init */
 
@@ -325,12 +328,17 @@ int main(void)
       HAL_GPIO_WritePin(I2C_ENABLE_GPIO_Port, I2C_ENABLE_Pin, GPIO_PIN_RESET);
 
       if (RM126x_WakeAndPing(&g_rm126x) == RM126X_RESULT_OK) {
+        RM126xResult send_result = RM126X_RESULT_TIMEOUT;
+
         if (g_rm126x.current_fport != tx_port) {
           (void)RM126x_SetFPort(&g_rm126x, tx_port);
         }
 
         if (g_rm126x.current_fport == tx_port) {
-          (void)RM126x_SendBytes(&g_rm126x, tx_payload, tx_length);
+          send_result = RM126x_SendBytes(&g_rm126x, tx_payload, tx_length);
+          if (send_result == RM126X_RESULT_OK) {
+            g_initial_send_pending = false;
+          }
         }
       }
     } else {
@@ -341,6 +349,11 @@ int main(void)
     (void)RM126x_HostUartSuspend(&g_rm126x);
     HAL_GPIO_WritePin(WD_DONE_GPIO_Port, WD_DONE_Pin, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(I2C_ENABLE_GPIO_Port, I2C_ENABLE_Pin, GPIO_PIN_RESET);
+
+    if (g_initial_send_pending) {
+      HAL_Delay(APP_INITIAL_SEND_RETRY_DELAY_MS);
+      continue;
+    }
 
     SleepManager_SleepUntilWake(APP_SLEEP_MINUTES_PER_SLOT);
 
