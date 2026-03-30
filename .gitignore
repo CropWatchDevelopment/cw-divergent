@@ -1,0 +1,30 @@
+# STM32CubeIDE build output
+/Debug/
+/Release/
+**/Debug/
+**/Release/
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+*.srec
+*.o
+*.d
+*.su
+*.cyclo
+
+# STM32CubeIDE/Eclipse local state
+/.settings/
+*.launch
+/.codex
+/.metadata/
+
+# Editor and OS noise
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
