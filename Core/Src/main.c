@@ -98,16 +98,13 @@ int main(void)
   MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
   /* Sleep manager owns the final RTC/IWDG configuration after CubeMX init. */
-  SleepManager_Init(&hrtc, &hiwdg);
+  SleepManager_Init(&hrtc, &hiwdg, &hi2c1);
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  HAL_GPIO_WritePin(DBG_LED_GPIO_Port, DBG_LED_Pin, GPIO_PIN_SET);
-	  HAL_Delay(1000);
-	  HAL_GPIO_WritePin(DBG_LED_GPIO_Port, DBG_LED_Pin, GPIO_PIN_RESET);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */

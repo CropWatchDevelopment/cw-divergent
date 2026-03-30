@@ -11,8 +11,11 @@ extern "C" {
 #define SLEEP_MANAGER_LSE_RETRY_CYCLES 3U
 #define SLEEP_MANAGER_MAX_SLEEP_MINUTES 60U
 
-/* Call from `main()` inside `USER CODE BEGIN 2` after CubeMX peripheral init. */
-void SleepManager_Init(RTC_HandleTypeDef *rtc, IWDG_HandleTypeDef *iwdg);
+/* Call from `main()` inside `USER CODE BEGIN 2` after CubeMX peripheral init.
+ * Pass the I2C handle used by external sensors so the bus can be parked in STOP.
+ */
+void SleepManager_Init(RTC_HandleTypeDef *rtc, IWDG_HandleTypeDef *iwdg,
+                       I2C_HandleTypeDef *i2c);
 void SleepManager_SleepUntilWake(uint32_t sleep_minutes);
 void SleepManager_FeedWatchdog(void);
 

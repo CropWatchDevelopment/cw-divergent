@@ -10,6 +10,9 @@
 #define SLEEP_MANAGER_SECONDS_PER_MINUTE     60U
 #define SLEEP_MANAGER_WAKE_CYCLES_PER_MINUTE \
   (SLEEP_MANAGER_SECONDS_PER_MINUTE / SLEEP_MANAGER_WAKE_INTERVAL_S)
+#define SLEEP_MANAGER_GPIOA_KEEP_MASK        (DBG_LED_Pin | GPIO_PIN_13 | GPIO_PIN_14)
+#define SLEEP_MANAGER_GPIOB_KEEP_MASK        I2C_ENABLE_Pin
+#define SLEEP_MANAGER_GPIOC_KEEP_MASK        (WD_DONE_Pin | GPIO_PIN_14 | GPIO_PIN_15)
 
 #if ((SLEEP_MANAGER_SECONDS_PER_MINUTE % SLEEP_MANAGER_WAKE_INTERVAL_S) != 0U)
 #error "SLEEP_MANAGER_WAKE_INTERVAL_S must divide evenly into 60 seconds."
@@ -25,6 +28,7 @@ typedef struct
 {
   RTC_HandleTypeDef *rtc;
   IWDG_HandleTypeDef *iwdg;
+  I2C_HandleTypeDef *i2c;
   volatile uint8_t wake_pending;
   volatile uint8_t lse_fault_pending;
   uint8_t lsi_wakeup_cycles;
@@ -40,6 +44,14 @@ static void sleep_manager_configure_run_clocks(void);
 static HAL_StatusTypeDef sleep_manager_set_lse_state(uint32_t lse_state);
 static void sleep_manager_clear_lse_css_flags(void);
 static void sleep_manager_init_watchdog(void);
+static void sleep_manager_enable_gpio_clocks(void);
+static void sleep_manager_disable_gpio_clocks(void);
+static void sleep_manager_configure_output(GPIO_TypeDef *port, uint16_t pin,
+                                           GPIO_PinState state, uint32_t pull,
+                                           uint32_t speed);
+static void sleep_manager_configure_analog(GPIO_TypeDef *port, uint16_t pins);
+static void sleep_manager_prepare_board_for_sleep(void);
+static void sleep_manager_restore_board_after_sleep(void);
 static HAL_StatusTypeDef sleep_manager_init_rtc(SleepManagerRtcSource source);
 static HAL_StatusTypeDef sleep_manager_select_rtc_clock(SleepManagerRtcSource source);
 static HAL_StatusTypeDef sleep_manager_switch_rtc_source(SleepManagerRtcSource source);
@@ -133,6 +145,120 @@ static void sleep_manager_init_watchdog(void)
   if (HAL_IWDG_Init(sleep_manager.iwdg) != HAL_OK)
   {
     Error_Handler();
+  }
+}
+
+static void sleep_manager_enable_gpio_clocks(void)
+{
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+#ifdef GPIOH
+  __HAL_RCC_GPIOH_CLK_ENABLE();
+#endif
+}
+
+static void sleep_manager_disable_gpio_clocks(void)
+{
+  __HAL_RCC_GPIOA_CLK_DISABLE();
+  __HAL_RCC_GPIOB_CLK_DISABLE();
+  __HAL_RCC_GPIOC_CLK_DISABLE();
+#ifdef GPIOH
+  __HAL_RCC_GPIOH_CLK_DISABLE();
+#endif
+}
+
+static void sleep_manager_configure_output(GPIO_TypeDef *port, uint16_t pin,
+                                           GPIO_PinState state, uint32_t pull,
+                                           uint32_t speed)
+{
+  GPIO_InitTypeDef gpio_init = {0};
+
+  HAL_GPIO_WritePin(port, pin, state);
+
+  gpio_init.Pin = pin;
+  gpio_init.Mode = GPIO_MODE_OUTPUT_PP;
+  gpio_init.Pull = pull;
+  gpio_init.Speed = speed;
+  HAL_GPIO_Init(port, &gpio_init);
+}
+
+static void sleep_manager_configure_analog(GPIO_TypeDef *port, uint16_t pins)
+{
+  GPIO_InitTypeDef gpio_init = {0};
+
+  if (pins == 0U)
+  {
+    return;
+  }
+
+  gpio_init.Pin = pins;
+  gpio_init.Mode = GPIO_MODE_ANALOG;
+  gpio_init.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(port, &gpio_init);
+}
+
+static void sleep_manager_prepare_board_for_sleep(void)
+{
+  sleep_manager_enable_gpio_clocks();
+
+  sleep_manager_configure_output(DBG_LED_GPIO_Port, DBG_LED_Pin, GPIO_PIN_RESET,
+                                 GPIO_NOPULL, GPIO_SPEED_FREQ_LOW);
+  sleep_manager_configure_output(WD_DONE_GPIO_Port, WD_DONE_Pin, GPIO_PIN_RESET,
+                                 GPIO_NOPULL, GPIO_SPEED_FREQ_LOW);
+  sleep_manager_configure_output(I2C_ENABLE_GPIO_Port, I2C_ENABLE_Pin, GPIO_PIN_RESET,
+                                 GPIO_PULLDOWN, GPIO_SPEED_FREQ_LOW);
+
+  if ((sleep_manager.i2c != NULL) &&
+      (sleep_manager.i2c->State != HAL_I2C_STATE_RESET))
+  {
+    if (HAL_I2C_DeInit(sleep_manager.i2c) != HAL_OK)
+    {
+      Error_Handler();
+    }
+  }
+
+  /* Keep only the board pins that must retain a defined state during STOP. */
+  sleep_manager_configure_analog(GPIOA,
+                                 (uint16_t)(GPIO_PIN_All & ~SLEEP_MANAGER_GPIOA_KEEP_MASK));
+  sleep_manager_configure_analog(GPIOB,
+                                 (uint16_t)(GPIO_PIN_All & ~SLEEP_MANAGER_GPIOB_KEEP_MASK));
+  sleep_manager_configure_analog(GPIOC,
+                                 (uint16_t)(GPIO_PIN_All & ~SLEEP_MANAGER_GPIOC_KEEP_MASK));
+#ifdef GPIOH
+  sleep_manager_configure_analog(GPIOH, GPIO_PIN_All);
+#endif
+
+  sleep_manager_disable_gpio_clocks();
+}
+
+static void sleep_manager_restore_board_after_sleep(void)
+{
+  sleep_manager_enable_gpio_clocks();
+
+  sleep_manager_configure_output(DBG_LED_GPIO_Port, DBG_LED_Pin, GPIO_PIN_RESET,
+                                 GPIO_NOPULL, GPIO_SPEED_FREQ_LOW);
+  sleep_manager_configure_output(WD_DONE_GPIO_Port, WD_DONE_Pin, GPIO_PIN_RESET,
+                                 GPIO_NOPULL, GPIO_SPEED_FREQ_MEDIUM);
+  sleep_manager_configure_output(I2C_ENABLE_GPIO_Port, I2C_ENABLE_Pin, GPIO_PIN_RESET,
+                                 GPIO_PULLDOWN, GPIO_SPEED_FREQ_HIGH);
+
+  if (sleep_manager.i2c != NULL)
+  {
+    if (HAL_I2C_Init(sleep_manager.i2c) != HAL_OK)
+    {
+      Error_Handler();
+    }
+
+    if (HAL_I2CEx_ConfigAnalogFilter(sleep_manager.i2c, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
+    {
+      Error_Handler();
+    }
+
+    if (HAL_I2CEx_ConfigDigitalFilter(sleep_manager.i2c, 0U) != HAL_OK)
+    {
+      Error_Handler();
+    }
   }
 }
 
@@ -251,7 +377,8 @@ static void sleep_manager_try_restore_lse(void)
   }
 }
 
-void SleepManager_Init(RTC_HandleTypeDef *rtc, IWDG_HandleTypeDef *iwdg)
+void SleepManager_Init(RTC_HandleTypeDef *rtc, IWDG_HandleTypeDef *iwdg,
+                       I2C_HandleTypeDef *i2c)
 {
   const bool had_prior_lse_css_fault = (__HAL_RCC_GET_FLAG(RCC_FLAG_LSECSS) != RESET);
 
@@ -262,6 +389,7 @@ void SleepManager_Init(RTC_HandleTypeDef *rtc, IWDG_HandleTypeDef *iwdg)
 
   sleep_manager.rtc = rtc;
   sleep_manager.iwdg = iwdg;
+  sleep_manager.i2c = i2c;
 
   sleep_manager.wake_pending = 0U;
   sleep_manager.lse_fault_pending = 0U;
@@ -364,11 +492,13 @@ void SleepManager_SleepUntilWake(uint32_t sleep_minutes)
   }
 
   remaining_cycles = sleep_minutes * SLEEP_MANAGER_WAKE_CYCLES_PER_MINUTE;
+  sleep_manager_prepare_board_for_sleep();
   while (remaining_cycles > 0U)
   {
     sleep_manager_wait_for_next_wake();
     remaining_cycles--;
   }
+  sleep_manager_restore_board_after_sleep();
 }
 
 void SleepManager_FeedWatchdog(void)
