@@ -7,6 +7,13 @@
 #define SLEEP_MANAGER_RTC_LSE_SYNCH_PREDIV   255U
 #define SLEEP_MANAGER_RTC_LSI_SYNCH_PREDIV   ((LSI_VALUE / 128U) - 1U)
 #define SLEEP_MANAGER_WAKEUP_COUNTER         (SLEEP_MANAGER_WAKE_INTERVAL_S - 1U)
+#define SLEEP_MANAGER_SECONDS_PER_MINUTE     60U
+#define SLEEP_MANAGER_WAKE_CYCLES_PER_MINUTE \
+  (SLEEP_MANAGER_SECONDS_PER_MINUTE / SLEEP_MANAGER_WAKE_INTERVAL_S)
+
+#if ((SLEEP_MANAGER_SECONDS_PER_MINUTE % SLEEP_MANAGER_WAKE_INTERVAL_S) != 0U)
+#error "SLEEP_MANAGER_WAKE_INTERVAL_S must divide evenly into 60 seconds."
+#endif
 
 typedef enum
 {
@@ -38,6 +45,7 @@ static HAL_StatusTypeDef sleep_manager_select_rtc_clock(SleepManagerRtcSource so
 static HAL_StatusTypeDef sleep_manager_switch_rtc_source(SleepManagerRtcSource source);
 static void sleep_manager_handle_lse_fault(void);
 static void sleep_manager_try_restore_lse(void);
+static void sleep_manager_wait_for_next_wake(void);
 
 static void sleep_manager_prepare_backup_domain(void)
 {
@@ -61,9 +69,12 @@ static void sleep_manager_configure_run_clocks(void)
   __HAL_RCC_PWR_CLK_ENABLE();
   __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
 
-  osc_init.OscillatorType = RCC_OSCILLATORTYPE_LSI | RCC_OSCILLATORTYPE_MSI;
+  osc_init.OscillatorType = RCC_OSCILLATORTYPE_LSI | RCC_OSCILLATORTYPE_MSI |
+                            RCC_OSCILLATORTYPE_HSI;
   osc_init.LSIState = RCC_LSI_ON;
   osc_init.MSIState = RCC_MSI_ON;
+  osc_init.HSIState = RCC_HSI_ON;
+  osc_init.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
   osc_init.MSICalibrationValue = 0;
   osc_init.MSIClockRange = RCC_MSIRANGE_5;
   osc_init.PLL.PLLState = RCC_PLL_NONE;
@@ -84,7 +95,8 @@ static void sleep_manager_configure_run_clocks(void)
   }
 
   periph_clk_init.PeriphClockSelection = RCC_PERIPHCLK_I2C1;
-  periph_clk_init.I2c1ClockSelection = RCC_I2C1CLKSOURCE_PCLK1;
+  /* ES0292 2.12.3 workaround: keep I2C1 kernel clock on HSI16 (> 4 MHz). */
+  periph_clk_init.I2c1ClockSelection = RCC_I2C1CLKSOURCE_HSI;
   if (HAL_RCCEx_PeriphCLKConfig(&periph_clk_init) != HAL_OK)
   {
     Error_Handler();
@@ -279,7 +291,7 @@ void SleepManager_Init(RTC_HandleTypeDef *rtc, IWDG_HandleTypeDef *iwdg)
   sleep_manager.initialized = 1U;
 }
 
-void SleepManager_SleepUntilWake(void)
+static void sleep_manager_wait_for_next_wake(void)
 {
   if (sleep_manager.initialized == 0U)
   {
@@ -334,6 +346,28 @@ void SleepManager_SleepUntilWake(void)
     }
 
     return;
+  }
+}
+
+void SleepManager_SleepUntilWake(uint32_t sleep_minutes)
+{
+  uint32_t remaining_cycles;
+
+  if (sleep_minutes == 0U)
+  {
+    return;
+  }
+
+  if (sleep_minutes > SLEEP_MANAGER_MAX_SLEEP_MINUTES)
+  {
+    Error_Handler();
+  }
+
+  remaining_cycles = sleep_minutes * SLEEP_MANAGER_WAKE_CYCLES_PER_MINUTE;
+  while (remaining_cycles > 0U)
+  {
+    sleep_manager_wait_for_next_wake();
+    remaining_cycles--;
   }
 }
 

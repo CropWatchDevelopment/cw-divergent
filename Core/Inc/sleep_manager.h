@@ -9,10 +9,11 @@ extern "C" {
 
 #define SLEEP_MANAGER_WAKE_INTERVAL_S 15U
 #define SLEEP_MANAGER_LSE_RETRY_CYCLES 3U
+#define SLEEP_MANAGER_MAX_SLEEP_MINUTES 60U
 
 /* Call from `main()` inside `USER CODE BEGIN 2` after CubeMX peripheral init. */
 void SleepManager_Init(RTC_HandleTypeDef *rtc, IWDG_HandleTypeDef *iwdg);
-void SleepManager_SleepUntilWake(void);
+void SleepManager_SleepUntilWake(uint32_t sleep_minutes);
 void SleepManager_FeedWatchdog(void);
 
 /* Call from `RTC_IRQHandler()` inside `USER CODE BEGIN RTC_IRQn 0`. */
