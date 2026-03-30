@@ -48,6 +48,8 @@ IWDG_HandleTypeDef hiwdg;
 RTC_HandleTypeDef hrtc;
 
 /* USER CODE BEGIN PV */
+static SensorDataSnapshot g_sensor_snapshot;
+static SensorDataStatus g_sensor_status = SENSOR_DATA_STATUS_NO_SENSORS;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -99,6 +101,7 @@ int main(void)
   /* USER CODE BEGIN 2 */
   /* Sleep manager owns the final RTC/IWDG configuration after CubeMX init. */
   SleepManager_Init(&hrtc, &hiwdg, &hi2c1);
+  SensorData_Init(&hi2c1);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -108,9 +111,22 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+	HAL_GPIO_WritePin(WD_DONE_GPIO_Port, WD_DONE_Pin, GPIO_PIN_SET); // Feeds the hardware watchdog
+	HAL_GPIO_WritePin(I2C_ENABLE_GPIO_Port, I2C_ENABLE_Pin, GPIO_PIN_SET);
+	HAL_Delay(300); // DONE Minimum DONE pulse width (5) 100 nS & 300ms is the min time to power i2c line
+	g_sensor_status = SensorData_ReadAll(&g_sensor_snapshot);
+
+
+	HAL_GPIO_WritePin(WD_DONE_GPIO_Port, WD_DONE_Pin, GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(I2C_ENABLE_GPIO_Port, I2C_ENABLE_Pin, GPIO_PIN_RESET);
+
     SleepManager_SleepUntilWake(1U);
 
     /* USER APP CODE BEGIN */
+    /* Caller owns I2C_ENABLE. Power the sensors, wait
+     * SENSOR_DATA_MIN_POWERUP_DELAY_MS, then call SensorData_Scan() or
+     * SensorData_ReadAll() here.
+     */
     /* Write the bulk of the application here. */
     /* USER APP CODE END */
   }
