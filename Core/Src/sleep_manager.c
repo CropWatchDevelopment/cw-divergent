@@ -16,8 +16,8 @@ typedef enum
 
 typedef struct
 {
-  RTC_HandleTypeDef rtc;
-  IWDG_HandleTypeDef iwdg;
+  RTC_HandleTypeDef *rtc;
+  IWDG_HandleTypeDef *iwdg;
   volatile uint8_t wake_pending;
   volatile uint8_t lse_fault_pending;
   uint8_t lsi_wakeup_cycles;
@@ -113,12 +113,12 @@ static void sleep_manager_clear_lse_css_flags(void)
 
 static void sleep_manager_init_watchdog(void)
 {
-  sleep_manager.iwdg.Instance = IWDG;
-  sleep_manager.iwdg.Init.Prescaler = IWDG_PRESCALER_256;
-  sleep_manager.iwdg.Init.Window = IWDG_WINDOW_DISABLE;
-  sleep_manager.iwdg.Init.Reload = SLEEP_MANAGER_IWDG_RELOAD_MAX;
+  sleep_manager.iwdg->Instance = IWDG;
+  sleep_manager.iwdg->Init.Prescaler = IWDG_PRESCALER_256;
+  sleep_manager.iwdg->Init.Window = IWDG_WINDOW_DISABLE;
+  sleep_manager.iwdg->Init.Reload = SLEEP_MANAGER_IWDG_RELOAD_MAX;
 
-  if (HAL_IWDG_Init(&sleep_manager.iwdg) != HAL_OK)
+  if (HAL_IWDG_Init(sleep_manager.iwdg) != HAL_OK)
   {
     Error_Handler();
   }
@@ -126,7 +126,7 @@ static void sleep_manager_init_watchdog(void)
 
 static HAL_StatusTypeDef sleep_manager_init_rtc(SleepManagerRtcSource source)
 {
-  RTC_HandleTypeDef *rtc = &sleep_manager.rtc;
+  RTC_HandleTypeDef *rtc = sleep_manager.rtc;
 
   rtc->Instance = RTC;
   rtc->Init.HourFormat = RTC_HOURFORMAT_24;
@@ -239,9 +239,17 @@ static void sleep_manager_try_restore_lse(void)
   }
 }
 
-void SleepManager_Init(void)
+void SleepManager_Init(RTC_HandleTypeDef *rtc, IWDG_HandleTypeDef *iwdg)
 {
   const bool had_prior_lse_css_fault = (__HAL_RCC_GET_FLAG(RCC_FLAG_LSECSS) != RESET);
+
+  if ((rtc == NULL) || (iwdg == NULL))
+  {
+    Error_Handler();
+  }
+
+  sleep_manager.rtc = rtc;
+  sleep_manager.iwdg = iwdg;
 
   sleep_manager.wake_pending = 0U;
   sleep_manager.lse_fault_pending = 0U;
@@ -331,40 +339,20 @@ void SleepManager_SleepUntilWake(void)
 
 void SleepManager_FeedWatchdog(void)
 {
-  if (HAL_IWDG_Refresh(&sleep_manager.iwdg) != HAL_OK)
+  if (HAL_IWDG_Refresh(sleep_manager.iwdg) != HAL_OK)
   {
     Error_Handler();
   }
 }
 
-void SleepManager_RTC_IRQHandler(void)
+void SleepManager_HandleRtcInterrupt(void)
 {
   HAL_RCCEx_LSECSS_IRQHandler();
-  HAL_RTCEx_WakeUpTimerIRQHandler(&sleep_manager.rtc);
-}
-
-void SleepManager_RTC_MspInit(RTC_HandleTypeDef *hrtc)
-{
-  if (hrtc->Instance == RTC)
-  {
-    __HAL_RCC_RTC_ENABLE();
-    HAL_NVIC_SetPriority(RTC_IRQn, 0, 0);
-    HAL_NVIC_EnableIRQ(RTC_IRQn);
-  }
-}
-
-void SleepManager_RTC_MspDeInit(RTC_HandleTypeDef *hrtc)
-{
-  if (hrtc->Instance == RTC)
-  {
-    __HAL_RCC_RTC_DISABLE();
-    HAL_NVIC_DisableIRQ(RTC_IRQn);
-  }
 }
 
 void HAL_RTCEx_WakeUpTimerEventCallback(RTC_HandleTypeDef *hrtc)
 {
-  if (hrtc == &sleep_manager.rtc)
+  if (hrtc == sleep_manager.rtc)
   {
     __HAL_PWR_CLEAR_FLAG(PWR_FLAG_WU);
     sleep_manager.wake_pending = 1U;
