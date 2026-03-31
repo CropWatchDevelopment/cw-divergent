@@ -1,12 +1,16 @@
 #include "RM126x.h"
 
 #include <ctype.h>
-#include <stdarg.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define RM126X_UART_WAIT_READY_TIMEOUT_MS  20UL
+
+enum {
+    RM126X_INFO_ID_APPLICATION_STATE = 42U,
+    RM126X_INFO_ID_CONNECTION_STATUS = 3001U,
+    RM126X_SREG_ID_APPLICATION_PORT = 629U
+};
 
 typedef struct {
     bool saw_wake;
@@ -16,6 +20,31 @@ typedef struct {
     bool has_payload;
     char payload[RM126X_MAX_RESPONSE_LINE_LENGTH];
 } RM126xResponseState;
+
+static RM126xResult RM126x_RefreshState(RM126xHandle* handle);
+static bool rm126x_append_char(char* buffer, size_t buffer_size, size_t* offset,
+                               char value);
+static bool rm126x_append_cstr(char* buffer, size_t buffer_size, size_t* offset,
+                               const char* value);
+static bool rm126x_append_u32(char* buffer, size_t buffer_size, size_t* offset,
+                              uint32_t value);
+static bool rm126x_append_i32(char* buffer, size_t buffer_size, size_t* offset,
+                              int32_t value);
+static RM126xResult rm126x_execute_command(RM126xHandle* handle, char* response,
+                                           size_t response_size,
+                                           uint32_t timeout_ms,
+                                           const char* command);
+static RM126xResult rm126x_build_query_int_command(char* command,
+                                                   size_t command_size,
+                                                   char family,
+                                                   uint16_t register_id);
+static RM126xResult rm126x_build_set_numeric_command(char* command,
+                                                     size_t command_size,
+                                                     uint16_t register_id,
+                                                     int32_t value);
+static RM126xResult rm126x_build_send_hex_command(char* command,
+                                                  size_t command_size,
+                                                  const char* hex_data);
 
 static void rm126x_update_pending_fport9(RM126xHandle* handle) {
     uint32_t next_tx_count;
@@ -223,7 +252,6 @@ static RM126xResult rm126x_uart_wait_tc(USART_TypeDef* uart, uint32_t timeout_ms
 static RM126xResult rm126x_uart_write(RM126xHandle* handle, const uint8_t* data,
                                       size_t length, uint32_t timeout_ms) {
     size_t index;
-    RM126xResult result;
 
     if ((handle == NULL) || (data == NULL)) {
         return RM126X_RESULT_INVALID_ARG;
@@ -234,8 +262,8 @@ static RM126xResult rm126x_uart_write(RM126xHandle* handle, const uint8_t* data,
     }
 
     for (index = 0U; index < length; ++index) {
-        result = rm126x_uart_write_byte(handle->config.uart.instance,
-                                        data[index], timeout_ms);
+        RM126xResult result = rm126x_uart_write_byte(
+            handle->config.uart.instance, data[index], timeout_ms);
         if (result != RM126X_RESULT_OK) {
             return result;
         }
@@ -468,31 +496,84 @@ static RM126xResult rm126x_send_line(RM126xHandle* handle, const char* command) 
                              handle->config.command_timeout_ms);
 }
 
-static RM126xResult rm126x_execute_formatted(RM126xHandle* handle,
-                                             char* response,
-                                             size_t response_size,
-                                             uint32_t timeout_ms,
-                                             const char* format, ...) {
-    char command[RM126X_MAX_COMMAND_LENGTH];
+static bool rm126x_append_char(char* buffer, size_t buffer_size, size_t* offset,
+                               char value) {
+    if ((buffer == NULL) || (offset == NULL) || (*offset >= (buffer_size - 1U))) {
+        return false;
+    }
+
+    buffer[*offset] = value;
+    (*offset)++;
+    buffer[*offset] = '\0';
+    return true;
+}
+
+static bool rm126x_append_cstr(char* buffer, size_t buffer_size, size_t* offset,
+                               const char* value) {
+    if (value == NULL) {
+        return false;
+    }
+
+    while (*value != '\0') {
+        if (!rm126x_append_char(buffer, buffer_size, offset, *value)) {
+            return false;
+        }
+        value++;
+    }
+
+    return true;
+}
+
+static bool rm126x_append_u32(char* buffer, size_t buffer_size, size_t* offset,
+                              uint32_t value) {
+    char digits[10];
+    size_t digit_count = 0U;
+
+    do {
+        digits[digit_count] = (char)('0' + (value % 10U));
+        digit_count++;
+        value /= 10U;
+    } while ((value != 0U) && (digit_count < sizeof(digits)));
+
+    while (digit_count > 0U) {
+        digit_count--;
+        if (!rm126x_append_char(buffer, buffer_size, offset, digits[digit_count])) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool rm126x_append_i32(char* buffer, size_t buffer_size, size_t* offset,
+                              int32_t value) {
+    uint32_t magnitude;
+
+    if (value < 0) {
+        if (!rm126x_append_char(buffer, buffer_size, offset, '-')) {
+            return false;
+        }
+        magnitude = (uint32_t)(-(value + 1)) + 1U;
+    } else {
+        magnitude = (uint32_t)value;
+    }
+
+    return rm126x_append_u32(buffer, buffer_size, offset, magnitude);
+}
+
+static RM126xResult rm126x_execute_command(RM126xHandle* handle, char* response,
+                                           size_t response_size,
+                                           uint32_t timeout_ms,
+                                           const char* command) {
     RM126xResponseState response_state;
     RM126xResult result;
-    va_list args;
-    int command_length;
 
-    if ((handle == NULL) || (format == NULL)) {
+    if ((handle == NULL) || (command == NULL)) {
         return RM126X_RESULT_INVALID_ARG;
     }
 
     if (!handle->uart_ready) {
         return RM126X_RESULT_TIMEOUT;
-    }
-
-    va_start(args, format);
-    command_length = vsnprintf(command, sizeof(command), format, args);
-    va_end(args);
-    if ((command_length < 0) ||
-        ((size_t)command_length >= sizeof(command))) {
-        return RM126X_RESULT_BUFFER_TOO_SMALL;
     }
 
     rm126x_reset_last_status(handle);
@@ -523,8 +604,71 @@ static RM126xResult rm126x_execute_formatted(RM126xHandle* handle,
     return result;
 }
 
+static RM126xResult rm126x_build_query_int_command(char* command,
+                                                   size_t command_size,
+                                                   char family,
+                                                   uint16_t register_id) {
+    size_t offset = 0U;
+
+    if ((family != 'I') && (family != 'S')) {
+        return RM126X_RESULT_INVALID_ARG;
+    }
+
+    command[0] = '\0';
+    if (!rm126x_append_cstr(command, command_size, &offset, "AT") ||
+        !rm126x_append_char(command, command_size, &offset, family) ||
+        !rm126x_append_char(command, command_size, &offset, ' ') ||
+        !rm126x_append_u32(command, command_size, &offset, register_id)) {
+        return RM126X_RESULT_BUFFER_TOO_SMALL;
+    }
+
+    if ((family != 'I') &&
+        !rm126x_append_char(command, command_size, &offset, '?')) {
+        return RM126X_RESULT_BUFFER_TOO_SMALL;
+    }
+
+    return RM126X_RESULT_OK;
+}
+
+static RM126xResult rm126x_build_set_numeric_command(char* command,
+                                                     size_t command_size,
+                                                     uint16_t register_id,
+                                                     int32_t value) {
+    size_t offset = 0U;
+
+    command[0] = '\0';
+    if (!rm126x_append_cstr(command, command_size, &offset, "ATS ") ||
+        !rm126x_append_u32(command, command_size, &offset, register_id) ||
+        !rm126x_append_char(command, command_size, &offset, '=') ||
+        !rm126x_append_i32(command, command_size, &offset, value)) {
+        return RM126X_RESULT_BUFFER_TOO_SMALL;
+    }
+
+    return RM126X_RESULT_OK;
+}
+
+static RM126xResult rm126x_build_send_hex_command(char* command,
+                                                  size_t command_size,
+                                                  const char* hex_data) {
+    size_t offset = 0U;
+
+    if (hex_data == NULL) {
+        return RM126X_RESULT_INVALID_ARG;
+    }
+
+    command[0] = '\0';
+    if (!rm126x_append_cstr(command, command_size, &offset, "AT+SEND \"") ||
+        !rm126x_append_cstr(command, command_size, &offset, hex_data) ||
+        !rm126x_append_char(command, command_size, &offset, '"')) {
+        return RM126X_RESULT_BUFFER_TOO_SMALL;
+    }
+
+    return RM126X_RESULT_OK;
+}
+
 static RM126xResult rm126x_query_int(RM126xHandle* handle, char family,
                                      uint16_t register_id, int32_t* value) {
+    char command[RM126X_MAX_COMMAND_LENGTH];
     char response[RM126X_MAX_RESPONSE_LINE_LENGTH];
     char* end_ptr = NULL;
     long parsed;
@@ -534,17 +678,14 @@ static RM126xResult rm126x_query_int(RM126xHandle* handle, char family,
         return RM126X_RESULT_INVALID_ARG;
     }
 
-    if (family == 'I') {
-        result = rm126x_execute_formatted(handle, response, sizeof(response),
-                                          handle->config.command_timeout_ms,
-                                          "ATI %u",
-                                          (unsigned int)register_id);
-    } else {
-        result = rm126x_execute_formatted(handle, response, sizeof(response),
-                                          handle->config.command_timeout_ms,
-                                          "AT%c %u?", family,
-                                          (unsigned int)register_id);
+    result = rm126x_build_query_int_command(command, sizeof(command), family,
+                                            register_id);
+    if (result != RM126X_RESULT_OK) {
+        return result;
     }
+
+    result = rm126x_execute_command(handle, response, sizeof(response),
+                                    handle->config.command_timeout_ms, command);
     if (result != RM126X_RESULT_OK) {
         return result;
     }
@@ -556,178 +697,6 @@ static RM126xResult rm126x_query_int(RM126xHandle* handle, char family,
 
     *value = (int32_t)parsed;
     return RM126X_RESULT_OK;
-}
-
-static RM126xResult rm126x_query_string(RM126xHandle* handle, char family,
-                                        uint16_t register_id, char* value,
-                                        size_t value_size) {
-    if ((handle == NULL) || (value == NULL) || (value_size == 0U)) {
-        return RM126X_RESULT_INVALID_ARG;
-    }
-
-    if (family == 'I') {
-        return rm126x_execute_formatted(handle, value, value_size,
-                                        handle->config.command_timeout_ms,
-                                        "ATI %u",
-                                        (unsigned int)register_id);
-    }
-
-    return rm126x_execute_formatted(handle, value, value_size,
-                                    handle->config.command_timeout_ms,
-                                    "AT%c %u?", family,
-                                    (unsigned int)register_id);
-}
-
-static RM126xResult rm126x_query_string_register(RM126xHandle* handle,
-                                                 uint16_t register_id,
-                                                 char* value,
-                                                 size_t value_size) {
-    if ((handle == NULL) || (value == NULL) || (value_size == 0U)) {
-        return RM126X_RESULT_INVALID_ARG;
-    }
-
-    return rm126x_execute_formatted(handle, value, value_size,
-                                    handle->config.command_timeout_ms,
-                                    "AT%%S %u?",
-                                    (unsigned int)register_id);
-}
-
-static RM126xResult rm126x_query_range(RM126xHandle* handle, char family,
-                                       uint16_t register_id,
-                                       RM126xNumericRange* range) {
-    char response[RM126X_MAX_RESPONSE_LINE_LENGTH];
-    char* separator = NULL;
-    char* end_ptr = NULL;
-    long min_value;
-    long max_value;
-    RM126xResult result;
-
-    if ((handle == NULL) || (range == NULL)) {
-        return RM126X_RESULT_INVALID_ARG;
-    }
-
-    result = rm126x_execute_formatted(handle, response, sizeof(response),
-                                      handle->config.command_timeout_ms,
-                                      "AT%c %u=?", family,
-                                      (unsigned int)register_id);
-    if (result != RM126X_RESULT_OK) {
-        return result;
-    }
-
-    separator = strchr(response, ',');
-    if (separator == NULL) {
-        return RM126X_RESULT_PARSE_ERROR;
-    }
-
-    *separator = '\0';
-    min_value = strtol(response, &end_ptr, 10);
-    if ((end_ptr == response) || (*end_ptr != '\0')) {
-        return RM126X_RESULT_PARSE_ERROR;
-    }
-
-    max_value = strtol(separator + 1, &end_ptr, 10);
-    if ((end_ptr == (separator + 1)) || (*end_ptr != '\0')) {
-        return RM126X_RESULT_PARSE_ERROR;
-    }
-
-    range->min_value = (int32_t)min_value;
-    range->max_value = (int32_t)max_value;
-    return RM126X_RESULT_OK;
-}
-
-static RM126xResult rm126x_query_string_range(RM126xHandle* handle,
-                                              uint16_t register_id,
-                                              RM126xNumericRange* range) {
-    char response[RM126X_MAX_RESPONSE_LINE_LENGTH];
-    char* separator = NULL;
-    char* end_ptr = NULL;
-    long min_value;
-    long max_value;
-    RM126xResult result;
-
-    if ((handle == NULL) || (range == NULL)) {
-        return RM126X_RESULT_INVALID_ARG;
-    }
-
-    result = rm126x_execute_formatted(handle, response, sizeof(response),
-                                      handle->config.command_timeout_ms,
-                                      "AT%%S %u=?",
-                                      (unsigned int)register_id);
-    if (result != RM126X_RESULT_OK) {
-        return result;
-    }
-
-    separator = strchr(response, ',');
-    if (separator == NULL) {
-        return RM126X_RESULT_PARSE_ERROR;
-    }
-
-    *separator = '\0';
-    min_value = strtol(response, &end_ptr, 10);
-    if ((end_ptr == response) || (*end_ptr != '\0')) {
-        return RM126X_RESULT_PARSE_ERROR;
-    }
-
-    max_value = strtol(separator + 1, &end_ptr, 10);
-    if ((end_ptr == (separator + 1)) || (*end_ptr != '\0')) {
-        return RM126X_RESULT_PARSE_ERROR;
-    }
-
-    range->min_value = (int32_t)min_value;
-    range->max_value = (int32_t)max_value;
-    return RM126X_RESULT_OK;
-}
-
-static RM126xResult rm126x_escape_string(const char* input, char* output,
-                                         size_t output_size) {
-    static const char hex_digits[] = "0123456789ABCDEF";
-    size_t in_index;
-    size_t out_index = 0U;
-
-    if ((input == NULL) || (output == NULL) || (output_size == 0U)) {
-        return RM126X_RESULT_INVALID_ARG;
-    }
-
-    for (in_index = 0U; input[in_index] != '\0'; ++in_index) {
-        unsigned char ch = (unsigned char)input[in_index];
-
-        if ((ch == '\\') || (ch == '"') || !isprint(ch)) {
-            if ((out_index + 4U) >= output_size) {
-                return RM126X_RESULT_BUFFER_TOO_SMALL;
-            }
-            output[out_index++] = '\\';
-            output[out_index++] = hex_digits[(ch >> 4U) & 0x0FU];
-            output[out_index++] = hex_digits[ch & 0x0FU];
-        } else {
-            if ((out_index + 1U) >= output_size) {
-                return RM126X_RESULT_BUFFER_TOO_SMALL;
-            }
-            output[out_index++] = (char)ch;
-        }
-    }
-
-    output[out_index] = '\0';
-    return RM126X_RESULT_OK;
-}
-
-static RM126xResult rm126x_set_string(RM126xHandle* handle, uint16_t register_id,
-                                      const char* value) {
-    char escaped[(RM126X_MAX_COMMAND_LENGTH * 2U) / 3U];
-    RM126xResult result;
-
-    if ((handle == NULL) || (value == NULL)) {
-        return RM126X_RESULT_INVALID_ARG;
-    }
-
-    result = rm126x_escape_string(value, escaped, sizeof(escaped));
-    if (result != RM126X_RESULT_OK) {
-        return result;
-    }
-
-    return rm126x_execute_formatted(handle, NULL, 0U,
-                                    handle->config.command_timeout_ms,
-                                    "AT%%S %u=\"%s\"",
-                                    (unsigned int)register_id, escaped);
 }
 
 static RM126xResult rm126x_validate_hex_string(RM126xHandle* handle,
@@ -843,13 +812,6 @@ RM126xResult RM126x_HostUartSuspend(RM126xHandle* handle) {
     return RM126X_RESULT_OK;
 }
 
-RM126xResult RM126x_Command(RM126xHandle* handle, const char* command,
-                            char* response, size_t response_size) {
-    return rm126x_execute_formatted(handle, response, response_size,
-                                    handle->config.command_timeout_ms,
-                                    "%s", command);
-}
-
 RM126xResult RM126x_WakeAndPing(RM126xHandle* handle) {
     RM126xResponseState response_state;
     RM126xResult result;
@@ -882,9 +844,9 @@ RM126xResult RM126x_WakeAndPing(RM126xHandle* handle) {
     }
 
     if ((result == RM126X_RESULT_TIMEOUT) && response_state.saw_wake) {
-        result = rm126x_execute_formatted(handle, NULL, 0U,
-                                          handle->config.command_timeout_ms,
-                                          "AT");
+        result = rm126x_execute_command(handle, NULL, 0U,
+                                        handle->config.command_timeout_ms,
+                                        "AT");
         handle->last_result = result;
         return result;
     }
@@ -894,127 +856,45 @@ RM126xResult RM126x_WakeAndPing(RM126xHandle* handle) {
 }
 
 RM126xResult RM126x_At(RM126xHandle* handle) {
-    return rm126x_execute_formatted(handle, NULL, 0U,
-                                    handle->config.command_timeout_ms, "AT");
-}
-
-RM126xResult RM126x_Save(RM126xHandle* handle) {
-    return rm126x_execute_formatted(handle, NULL, 0U,
-                                    handle->config.command_timeout_ms, "AT&W");
+    return rm126x_execute_command(handle, NULL, 0U,
+                                  handle->config.command_timeout_ms, "AT");
 }
 
 RM126xResult RM126x_Reset(RM126xHandle* handle) {
-    return rm126x_execute_formatted(handle, NULL, 0U,
-                                    handle->config.command_timeout_ms, "ATZ");
+    return rm126x_execute_command(handle, NULL, 0U,
+                                  handle->config.command_timeout_ms, "ATZ");
 }
 
-RM126xResult RM126x_GetInfoInt(RM126xHandle* handle, RM126xInfoId info_id,
-                               int32_t* value) {
-    return rm126x_query_int(handle, 'I', (uint16_t)info_id, value);
+static RM126xResult RM126x_GetInfoInt(RM126xHandle* handle, uint16_t info_id,
+                                      int32_t* value) {
+    return rm126x_query_int(handle, 'I', info_id, value);
 }
 
-RM126xResult RM126x_GetInfoString(RM126xHandle* handle, RM126xInfoId info_id,
-                                  char* value, size_t value_size) {
-    return rm126x_query_string(handle, 'I', (uint16_t)info_id,
-                               value, value_size);
-}
+static RM126xResult RM126x_SetNumericRegister(RM126xHandle* handle,
+                                              uint16_t register_id,
+                                              int32_t value) {
+    char command[RM126X_MAX_COMMAND_LENGTH];
+    RM126xResult result = rm126x_build_set_numeric_command(
+        command, sizeof(command), register_id, value);
 
-RM126xResult RM126x_SetNumericRegister(RM126xHandle* handle,
-                                       RM126xSRegisterId register_id,
-                                       int32_t value) {
-    return rm126x_execute_formatted(handle, NULL, 0U,
-                                    handle->config.command_timeout_ms,
-                                    "ATS %u=%ld",
-                                    (unsigned int)register_id, (long)value);
-}
-
-RM126xResult RM126x_GetNumericRegister(RM126xHandle* handle,
-                                       RM126xSRegisterId register_id,
-                                       int32_t* value) {
-    return rm126x_query_int(handle, 'S', (uint16_t)register_id, value);
-}
-
-RM126xResult RM126x_GetNumericRegisterRange(RM126xHandle* handle,
-                                            RM126xSRegisterId register_id,
-                                            RM126xNumericRange* range) {
-    return rm126x_query_range(handle, 'S', (uint16_t)register_id, range);
-}
-
-RM126xResult RM126x_SetStringRegister(RM126xHandle* handle,
-                                      RM126xStringRegisterId register_id,
-                                      const char* value) {
-    return rm126x_set_string(handle, (uint16_t)register_id, value);
-}
-
-RM126xResult RM126x_GetStringRegister(RM126xHandle* handle,
-                                      RM126xStringRegisterId register_id,
-                                      char* value, size_t value_size) {
-    return rm126x_query_string_register(handle, (uint16_t)register_id,
-                                        value, value_size);
-}
-
-RM126xResult RM126x_GetStringRegisterRange(RM126xHandle* handle,
-                                           RM126xStringRegisterId register_id,
-                                           RM126xStringRange* range) {
-    RM126xNumericRange numeric_range;
-    RM126xResult result;
-
-    if ((handle == NULL) || (range == NULL)) {
-        return RM126X_RESULT_INVALID_ARG;
-    }
-
-    result = rm126x_query_string_range(handle, (uint16_t)register_id,
-                                       &numeric_range);
     if (result != RM126X_RESULT_OK) {
         return result;
     }
 
-    range->min_length = (uint16_t)numeric_range.min_value;
-    range->max_length = (uint16_t)numeric_range.max_value;
-    return RM126X_RESULT_OK;
+    return rm126x_execute_command(handle, NULL, 0U,
+                                  handle->config.command_timeout_ms, command);
 }
 
-RM126xResult RM126x_I2CRead(RM126xHandle* handle, const char* hex_data,
-                            uint32_t out_length, char* response,
-                            size_t response_size) {
-    RM126xResult result = rm126x_validate_hex_string(handle, hex_data);
-    if (result != RM126X_RESULT_OK) {
-        return result;
-    }
-
-    return rm126x_execute_formatted(handle, response, response_size,
-                                    handle->config.command_timeout_ms,
-                                    "AT+I2R %s,%lu", hex_data,
-                                    (unsigned long)out_length);
-}
-
-RM126xResult RM126x_I2CWrite(RM126xHandle* handle, const char* hex_data) {
-    RM126xResult result = rm126x_validate_hex_string(handle, hex_data);
-    if (result != RM126X_RESULT_OK) {
-        return result;
-    }
-
-    return rm126x_execute_formatted(handle, NULL, 0U,
-                                    handle->config.command_timeout_ms,
-                                    "AT+I2W %s", hex_data);
-}
-
-RM126xResult RM126x_Drop(RM126xHandle* handle) {
-    RM126xResult result = rm126x_execute_formatted(handle, NULL, 0U,
-                                                   handle->config.command_timeout_ms,
-                                                   "AT+DROP");
-    if (result == RM126X_RESULT_OK) {
-        handle->is_connected = false;
-        handle->last_connection_status = RM126X_CONNECTION_STATUS_NOT_CONNECTED;
-        handle->last_app_state = RM126X_APP_STATE_DISCONNECTED;
-    }
-    return result;
+static RM126xResult RM126x_GetNumericRegister(RM126xHandle* handle,
+                                              uint16_t register_id,
+                                              int32_t* value) {
+    return rm126x_query_int(handle, 'S', register_id, value);
 }
 
 RM126xResult RM126x_Join(RM126xHandle* handle) {
-    RM126xResult result = rm126x_execute_formatted(handle, NULL, 0U,
-                                                   handle->config.command_timeout_ms,
-                                                   "AT+JOIN");
+    RM126xResult result = rm126x_execute_command(handle, NULL, 0U,
+                                                 handle->config.command_timeout_ms,
+                                                 "AT+JOIN");
     if (result == RM126X_RESULT_OK) {
         handle->is_connected = false;
         handle->last_app_state = RM126X_APP_STATE_JOINING;
@@ -1040,59 +920,8 @@ RM126xResult RM126x_Join(RM126xHandle* handle) {
     return result;
 }
 
-RM126xResult RM126x_MulticastGroupAdd(RM126xHandle* handle, uint8_t group_id,
-                                      uint32_t group_address,
-                                      const char* ns_key_hex) {
-    RM126xResult result = rm126x_validate_hex_string(handle, ns_key_hex);
-    if (result != RM126X_RESULT_OK) {
-        return result;
-    }
-
-    return rm126x_execute_formatted(handle, NULL, 0U,
-                                    handle->config.command_timeout_ms,
-                                    "AT+MCGA %u,%lu,%s",
-                                    (unsigned int)group_id,
-                                    (unsigned long)group_address, ns_key_hex);
-}
-
-RM126xResult RM126x_MulticastGroupEnd(RM126xHandle* handle, uint8_t group_id) {
-    return rm126x_execute_formatted(handle, NULL, 0U,
-                                    handle->config.command_timeout_ms,
-                                    "AT+MCGE %u", (unsigned int)group_id);
-}
-
-RM126xResult RM126x_MulticastGroupList(RM126xHandle* handle, uint8_t group_id,
-                                       char* response, size_t response_size) {
-    return rm126x_execute_formatted(handle, response, response_size,
-                                    handle->config.command_timeout_ms,
-                                    "AT+MCGL %u", (unsigned int)group_id);
-}
-
-RM126xResult RM126x_MulticastGroupRemove(RM126xHandle* handle, uint8_t group_id) {
-    return rm126x_execute_formatted(handle, NULL, 0U,
-                                    handle->config.command_timeout_ms,
-                                    "AT+MCGR %u", (unsigned int)group_id);
-}
-
-RM126xResult RM126x_MulticastGroupStart(RM126xHandle* handle, uint8_t group_id) {
-    return rm126x_execute_formatted(handle, NULL, 0U,
-                                    handle->config.command_timeout_ms,
-                                    "AT+MCGS %u", (unsigned int)group_id);
-}
-
-RM126xResult RM126x_DutyCheck(RM126xHandle* handle, uint8_t payload_length) {
-    return rm126x_execute_formatted(handle, NULL, 0U,
-                                    handle->config.command_timeout_ms,
-                                    "AT+DUTY %u", (unsigned int)payload_length);
-}
-
-RM126xResult RM126x_LinkCheck(RM126xHandle* handle) {
-    return rm126x_execute_formatted(handle, NULL, 0U,
-                                    handle->config.command_timeout_ms,
-                                    "AT+LINKC");
-}
-
-RM126xResult RM126x_SendHex(RM126xHandle* handle, const char* hex_data) {
+static RM126xResult RM126x_SendHex(RM126xHandle* handle, const char* hex_data) {
+    char command[RM126X_MAX_COMMAND_LENGTH];
     RM126xResult result;
 
     result = rm126x_validate_hex_string(handle, hex_data);
@@ -1100,9 +929,13 @@ RM126xResult RM126x_SendHex(RM126xHandle* handle, const char* hex_data) {
         return result;
     }
 
-    result = rm126x_execute_formatted(handle, NULL, 0U,
-                                      handle->config.command_timeout_ms,
-                                      "AT+SEND \"%s\"", hex_data);
+    result = rm126x_build_send_hex_command(command, sizeof(command), hex_data);
+    if (result != RM126X_RESULT_OK) {
+        return result;
+    }
+
+    result = rm126x_execute_command(handle, NULL, 0U,
+                                    handle->config.command_timeout_ms, command);
     if (result == RM126X_RESULT_OK) {
         handle->accepted_uplink_count++;
         rm126x_update_pending_fport9(handle);
@@ -1146,157 +979,20 @@ RM126xResult RM126x_SendBytes(RM126xHandle* handle, const uint8_t* data,
     return RM126x_SendHex(handle, hex_buffer);
 }
 
-RM126xResult RM126x_TimeRequest(RM126xHandle* handle) {
-    return rm126x_execute_formatted(handle, NULL, 0U,
-                                    handle->config.command_timeout_ms,
-                                    "AT+TIME");
-}
-
-RM126xResult RM126x_P2PEnable(RM126xHandle* handle) {
-    return rm126x_execute_formatted(handle, NULL, 0U,
-                                    handle->config.command_timeout_ms,
-                                    "AT+P2PE");
-}
-
-RM126xResult RM126x_P2PStart(RM126xHandle* handle) {
-    return rm126x_execute_formatted(handle, NULL, 0U,
-                                    handle->config.command_timeout_ms,
-                                    "AT+P2PS");
-}
-
-RM126xResult RM126x_P2PTransmit(RM126xHandle* handle, uint8_t peer_id,
-                                const char* data) {
-    char escaped[(RM126X_MAX_COMMAND_LENGTH * 2U) / 3U];
-    RM126xResult result;
-
-    if ((handle == NULL) || (data == NULL)) {
-        return RM126X_RESULT_INVALID_ARG;
-    }
-
-    result = rm126x_escape_string(data, escaped, sizeof(escaped));
-    if (result != RM126X_RESULT_OK) {
-        return result;
-    }
-
-    return rm126x_execute_formatted(handle, NULL, 0U,
-                                    handle->config.command_timeout_ms,
-                                    "AT+P2PT %u,\"%s\"",
-                                    (unsigned int)peer_id, escaped);
-}
-
-RM126xResult RM126x_SioConfigure(RM126xHandle* handle, uint8_t sio_number,
-                                 uint8_t function, int32_t sub_function) {
-    return rm126x_execute_formatted(handle, NULL, 0U,
-                                    handle->config.command_timeout_ms,
-                                    "AT+SIOC %u,%u,%ld",
-                                    (unsigned int)sio_number,
-                                    (unsigned int)function,
-                                    (long)sub_function);
-}
-
-RM126xResult RM126x_SioRead(RM126xHandle* handle, uint8_t sio_number,
-                            char* response, size_t response_size) {
-    return rm126x_execute_formatted(handle, response, response_size,
-                                    handle->config.command_timeout_ms,
-                                    "AT+SIOR %u", (unsigned int)sio_number);
-}
-
-RM126xResult RM126x_SioWrite(RM126xHandle* handle, uint8_t sio_number,
-                             uint8_t value) {
-    return rm126x_execute_formatted(handle, NULL, 0U,
-                                    handle->config.command_timeout_ms,
-                                    "AT+SIOW %u,%u",
-                                    (unsigned int)sio_number,
-                                    (unsigned int)value);
-}
-
-RM126xResult RM126x_SpiRead(RM126xHandle* handle, uint8_t device_id,
-                            const char* hex_data, uint32_t out_length,
-                            char* response, size_t response_size) {
-    RM126xResult result = rm126x_validate_hex_string(handle, hex_data);
-    if (result != RM126X_RESULT_OK) {
-        return result;
-    }
-
-    return rm126x_execute_formatted(handle, response, response_size,
-                                    handle->config.command_timeout_ms,
-                                    "AT+SPR %u,%s,%lu",
-                                    (unsigned int)device_id, hex_data,
-                                    (unsigned long)out_length);
-}
-
-RM126xResult RM126x_SpiWrite(RM126xHandle* handle, uint8_t device_id,
-                             const char* hex_data) {
-    RM126xResult result = rm126x_validate_hex_string(handle, hex_data);
-    if (result != RM126X_RESULT_OK) {
-        return result;
-    }
-
-    return rm126x_execute_formatted(handle, NULL, 0U,
-                                    handle->config.command_timeout_ms,
-                                    "AT+SPW %u,%s",
-                                    (unsigned int)device_id, hex_data);
-}
-
-RM126xResult RM126x_ContinuousReceive(RM126xHandle* handle, uint8_t start_test,
-                                      const char* ctx_dev_eui) {
-    RM126xResult result = rm126x_validate_hex_string(handle, ctx_dev_eui);
-    if (result != RM126X_RESULT_OK) {
-        return result;
-    }
-
-    return rm126x_execute_formatted(handle, NULL, 0U,
-                                    handle->config.command_timeout_ms,
-                                    "AT+CRX %u,\"%s\"",
-                                    (unsigned int)start_test, ctx_dev_eui);
-}
-
-RM126xResult RM126x_ContinuousTransmit(RM126xHandle* handle) {
-    return rm126x_execute_formatted(handle, NULL, 0U,
-                                    handle->config.command_timeout_ms,
-                                    "AT+CTX");
-}
-
 RM126xResult RM126x_ReadTemperature(RM126xHandle* handle, char* response,
                                     size_t response_size) {
-    return rm126x_execute_formatted(handle, response, response_size,
-                                    handle->config.command_timeout_ms,
-                                    "AT+TEMP");
-}
-
-RM126xResult RM126x_SetBatteryStatus(RM126xHandle* handle,
-                                     uint8_t battery_status) {
-    return rm126x_execute_formatted(handle, NULL, 0U,
-                                    handle->config.command_timeout_ms,
-                                    "AT+BAT %u", (unsigned int)battery_status);
+    return rm126x_execute_command(handle, response, response_size,
+                                  handle->config.command_timeout_ms, "AT+TEMP");
 }
 
 RM126xResult RM126x_Sleep(RM126xHandle* handle) {
-    return rm126x_execute_formatted(handle, NULL, 0U,
-                                    handle->config.command_timeout_ms,
-                                    "AT+SLEEP");
+    return rm126x_execute_command(handle, NULL, 0U,
+                                  handle->config.command_timeout_ms,
+                                  "AT+SLEEP");
 }
 
-RM126xResult RM126x_SupplyCancel(RM126xHandle* handle) {
-    return rm126x_execute_formatted(handle, NULL, 0U,
-                                    handle->config.command_timeout_ms,
-                                    "AT+SUPC");
-}
-
-RM126xResult RM126x_SupplyImmediate(RM126xHandle* handle) {
-    return rm126x_execute_formatted(handle, NULL, 0U,
-                                    handle->config.command_timeout_ms,
-                                    "AT+SUPI");
-}
-
-RM126xResult RM126x_SupplyScheduled(RM126xHandle* handle) {
-    return rm126x_execute_formatted(handle, NULL, 0U,
-                                    handle->config.command_timeout_ms,
-                                    "AT+SUPS");
-}
-
-RM126xResult RM126x_ReadApplicationState(RM126xHandle* handle,
-                                         RM126xApplicationState* state) {
+static RM126xResult RM126x_ReadApplicationState(RM126xHandle* handle,
+                                                RM126xApplicationState* state) {
     int32_t value = 0;
     RM126xResult result;
 
@@ -1304,7 +1000,7 @@ RM126xResult RM126x_ReadApplicationState(RM126xHandle* handle,
         return RM126X_RESULT_INVALID_ARG;
     }
 
-    result = RM126x_GetInfoInt(handle, RM126X_INFO_APPLICATION_STATE, &value);
+    result = RM126x_GetInfoInt(handle, RM126X_INFO_ID_APPLICATION_STATE, &value);
     if (result != RM126X_RESULT_OK) {
         return result;
     }
@@ -1319,8 +1015,8 @@ RM126xResult RM126x_ReadApplicationState(RM126xHandle* handle,
     return RM126X_RESULT_OK;
 }
 
-RM126xResult RM126x_ReadConnectionStatus(RM126xHandle* handle,
-                                         RM126xConnectionStatus* status) {
+static RM126xResult RM126x_ReadConnectionStatus(RM126xHandle* handle,
+                                                RM126xConnectionStatus* status) {
     int32_t value = 0;
     RM126xResult result;
 
@@ -1328,7 +1024,7 @@ RM126xResult RM126x_ReadConnectionStatus(RM126xHandle* handle,
         return RM126X_RESULT_INVALID_ARG;
     }
 
-    result = RM126x_GetInfoInt(handle, RM126X_INFO_CONNECTION_STATUS, &value);
+    result = RM126x_GetInfoInt(handle, RM126X_INFO_ID_CONNECTION_STATUS, &value);
     if (result != RM126X_RESULT_OK) {
         return result;
     }
@@ -1344,7 +1040,7 @@ RM126xResult RM126x_ReadConnectionStatus(RM126xHandle* handle,
     return RM126X_RESULT_OK;
 }
 
-RM126xResult RM126x_ReadPort(RM126xHandle* handle, uint8_t* fport) {
+static RM126xResult RM126x_ReadPort(RM126xHandle* handle, uint8_t* fport) {
     int32_t value = 0;
     RM126xResult result;
 
@@ -1352,7 +1048,7 @@ RM126xResult RM126x_ReadPort(RM126xHandle* handle, uint8_t* fport) {
         return RM126X_RESULT_INVALID_ARG;
     }
 
-    result = RM126x_GetNumericRegister(handle, RM126X_SREG_APPLICATION_PORT,
+    result = RM126x_GetNumericRegister(handle, RM126X_SREG_ID_APPLICATION_PORT,
                                        &value);
     if (result != RM126X_RESULT_OK) {
         return result;
@@ -1374,7 +1070,7 @@ RM126xResult RM126x_SetFPort(RM126xHandle* handle, uint8_t fport) {
         return RM126X_RESULT_INVALID_ARG;
     }
 
-    result = RM126x_SetNumericRegister(handle, RM126X_SREG_APPLICATION_PORT,
+    result = RM126x_SetNumericRegister(handle, RM126X_SREG_ID_APPLICATION_PORT,
                                        (int32_t)fport);
     if (result == RM126X_RESULT_OK) {
         handle->current_fport = fport;
@@ -1387,11 +1083,11 @@ RM126xResult RM126x_SetFPort(RM126xHandle* handle, uint8_t fport) {
     return result;
 }
 
-RM126xResult RM126x_RefreshState(RM126xHandle* handle) {
+static RM126xResult RM126x_RefreshState(RM126xHandle* handle) {
     RM126xApplicationState app_state = RM126X_APP_STATE_UNKNOWN;
     RM126xConnectionStatus connection_status =
         RM126X_CONNECTION_STATUS_UNKNOWN;
-    uint8_t current_port = handle->current_fport;
+    uint8_t current_port;
     RM126xResult result;
     RM126xResult app_result;
     RM126xResult connection_result;
@@ -1399,6 +1095,8 @@ RM126xResult RM126x_RefreshState(RM126xHandle* handle) {
     if (handle == NULL) {
         return RM126X_RESULT_INVALID_ARG;
     }
+
+    current_port = handle->current_fport;
 
     result = RM126x_WakeAndPing(handle);
     if (result != RM126X_RESULT_OK) {
@@ -1446,10 +1144,6 @@ bool RM126x_IsConnected(RM126xHandle* handle) {
     return (status == RM126X_CONNECTION_STATUS_CONNECTED);
 }
 
-uint32_t RM126x_GetLastErrorCode(const RM126xHandle* handle) {
-    return (handle != NULL) ? handle->last_error_code : 0UL;
-}
-
 RM126xAtErrorCode RM126x_GetLastAtError(const RM126xHandle* handle) {
     return (handle != NULL) ? handle->last_error : RM126X_AT_ERROR_NONE;
 }
@@ -1460,13 +1154,4 @@ const RM126xAsyncEvent* RM126x_GetLastAsyncEvent(const RM126xHandle* handle) {
 
 bool RM126x_ShouldSendDiagnosticPort9(const RM126xHandle* handle) {
     return (handle != NULL) ? handle->pending_fport9 : false;
-}
-
-void RM126x_SetAcceptedUplinkCount(RM126xHandle* handle, uint32_t count) {
-    if (handle == NULL) {
-        return;
-    }
-
-    handle->accepted_uplink_count = count;
-    rm126x_update_pending_fport9(handle);
 }

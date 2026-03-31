@@ -37,9 +37,11 @@ ENTRY(Reset_Handler)
 
 /* Highest address of the user mode stack */
 _estack = ORIGIN(RAM) + LENGTH(RAM); /* end of "RAM" Ram type memory */
+__StackTop = _estack;
 
-_Min_Heap_Size = 0x800; /* required amount of heap */
+_Min_Heap_Size = 0x0; /* required amount of heap */
 _Min_Stack_Size = 0x1400; /* required amount of stack */
+__StackLimit = _estack - _Min_Stack_Size;
 
 /* Memories definition */
 MEMORY
@@ -150,6 +152,15 @@ SECTIONS
   } >RAM AT> FLASH
 
   /* Uninitialized data section into "RAM" Ram type memory */
+  . = ALIGN(4);
+  .noinit (NOLOAD) :
+  {
+    . = ALIGN(4);
+    *(.noinit)
+    *(.noinit*)
+    . = ALIGN(4);
+  } >RAM
+
   . = ALIGN(4);
   .bss :
   {

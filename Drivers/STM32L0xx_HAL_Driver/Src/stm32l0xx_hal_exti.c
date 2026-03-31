@@ -473,6 +473,7 @@ uint32_t HAL_EXTI_GetPending(EXTI_HandleTypeDef *hexti, uint32_t Edge)
   assert_param(IS_EXTI_LINE(hexti->Line));
   assert_param(IS_EXTI_CONFIG_LINE(hexti->Line));
   assert_param(IS_EXTI_PENDING_EDGE(Edge));
+  (void)Edge;
 
   /* Compute line mask */
   linepos = (hexti->Line & EXTI_PIN_MASK);
@@ -500,6 +501,7 @@ void HAL_EXTI_ClearPending(EXTI_HandleTypeDef *hexti, uint32_t Edge)
   assert_param(IS_EXTI_LINE(hexti->Line));
   assert_param(IS_EXTI_CONFIG_LINE(hexti->Line));
   assert_param(IS_EXTI_PENDING_EDGE(Edge));
+  (void)Edge;
 
   /* Compute line mask */
   maskline = (1uL << (hexti->Line & EXTI_PIN_MASK));
@@ -544,4 +546,3 @@ void HAL_EXTI_GenerateSWI(EXTI_HandleTypeDef *hexti)
 /**
   * @}
   */
-

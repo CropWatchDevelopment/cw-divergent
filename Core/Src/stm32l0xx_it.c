@@ -22,6 +22,7 @@
 #include "stm32l0xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "app_safety.h"
 #include "sleep_manager.h"
 /* USER CODE END Includes */
 
@@ -67,31 +68,39 @@ extern RTC_HandleTypeDef hrtc;
 /**
   * @brief This function handles Non maskable Interrupt.
   */
-void NMI_Handler(void)
+__attribute__((naked)) void NMI_Handler(void)
 {
-  /* USER CODE BEGIN NonMaskableInt_IRQn 0 */
-
-  /* USER CODE END NonMaskableInt_IRQn 0 */
-  /* USER CODE BEGIN NonMaskableInt_IRQn 1 */
-   while (1)
-  {
-  }
-  /* USER CODE END NonMaskableInt_IRQn 1 */
+  __asm volatile(
+      "movs r1, #4                  \n"
+      "mov r2, lr                   \n"
+      "tst r2, r1                   \n"
+      "beq 1f                       \n"
+      "mrs r0, psp                  \n"
+      "b 2f                         \n"
+      "1:                           \n"
+      "mrs r0, msp                  \n"
+      "2:                           \n"
+      "ldr r1, =AppSafety_HandleNmi \n"
+      "bx r1                        \n");
 }
 
 /**
   * @brief This function handles Hard fault interrupt.
   */
-void HardFault_Handler(void)
+__attribute__((naked)) void HardFault_Handler(void)
 {
-  /* USER CODE BEGIN HardFault_IRQn 0 */
-
-  /* USER CODE END HardFault_IRQn 0 */
-  while (1)
-  {
-    /* USER CODE BEGIN W1_HardFault_IRQn 0 */
-    /* USER CODE END W1_HardFault_IRQn 0 */
-  }
+  __asm volatile(
+      "movs r1, #4                     \n"
+      "mov r2, lr                      \n"
+      "tst r2, r1                      \n"
+      "beq 1f                          \n"
+      "mrs r0, psp                     \n"
+      "b 2f                            \n"
+      "1:                              \n"
+      "mrs r0, msp                     \n"
+      "2:                              \n"
+      "ldr r1, =AppSafety_HandleHardFault \n"
+      "bx r1                            \n");
 }
 
 /**

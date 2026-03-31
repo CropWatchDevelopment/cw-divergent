@@ -463,7 +463,7 @@ HAL_StatusTypeDef HAL_FLASHEx_AdvOBProgram (FLASH_AdvOBProgramInitTypeDef *pAdvO
   /* Program BOOT config option byte */
   if ((pAdvOBInit->OptionType & OPTIONBYTE_BOOTCONFIG) == OPTIONBYTE_BOOTCONFIG)
   {
-    status = FLASH_OB_BootConfig(pAdvOBInit->BootConfig);
+    status = FLASH_OB_BootConfig((uint8_t)pAdvOBInit->BootConfig);
   }
   
 #endif /* FLASH_OPTR_BFB2 */
@@ -1260,4 +1260,3 @@ void FLASH_PageErase(uint32_t PageAddress)
 /**
   * @}
   */
-

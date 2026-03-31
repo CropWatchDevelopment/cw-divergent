@@ -34,8 +34,12 @@ static int16_t sht4x_read_measurement_ticks(uint8_t command, uint32_t delay_us,
         return BYTE_NUM_ERROR;
     }
 
-    offset = sensirion_i2c_add_command8_to_buffer(communication_buffer, offset,
-                                                  command);
+    error = sensirion_i2c_add_command8_to_buffer(communication_buffer,
+                                                 sizeof(communication_buffer),
+                                                 &offset, command);
+    if (error != NO_ERROR) {
+        return error;
+    }
     error = sensirion_i2c_write_data(sht4x_i2c_address, communication_buffer,
                                      offset);
     if (error != NO_ERROR) {
@@ -45,7 +49,8 @@ static int16_t sht4x_read_measurement_ticks(uint8_t command, uint32_t delay_us,
     sensirion_i2c_hal_sleep_usec(delay_us);
 
     error = sensirion_i2c_read_data_inplace(sht4x_i2c_address,
-                                            communication_buffer, 4U);
+                                            communication_buffer,
+                                            sizeof(communication_buffer), 4U);
     if (error != NO_ERROR) {
         return error;
     }
@@ -222,8 +227,13 @@ int16_t sht4x_serial_number(uint32_t* serial_number) {
         return BYTE_NUM_ERROR;
     }
 
-    offset = sensirion_i2c_add_command8_to_buffer(communication_buffer, offset,
-                                                  SHT4X_SERIAL_NUMBER_CMD_ID);
+    error = sensirion_i2c_add_command8_to_buffer(communication_buffer,
+                                                 sizeof(communication_buffer),
+                                                 &offset,
+                                                 SHT4X_SERIAL_NUMBER_CMD_ID);
+    if (error != NO_ERROR) {
+        return error;
+    }
     error = sensirion_i2c_write_data(sht4x_i2c_address, communication_buffer,
                                      offset);
     if (error != NO_ERROR) {
@@ -233,7 +243,8 @@ int16_t sht4x_serial_number(uint32_t* serial_number) {
     sensirion_i2c_hal_sleep_usec(SHT4X_SERIAL_NUMBER_DELAY_US);
 
     error = sensirion_i2c_read_data_inplace(sht4x_i2c_address,
-                                            communication_buffer, 4U);
+                                            communication_buffer,
+                                            sizeof(communication_buffer), 4U);
     if (error != NO_ERROR) {
         return error;
     }
@@ -247,8 +258,13 @@ int16_t sht4x_soft_reset(void) {
     int16_t error;
     uint16_t offset = 0U;
 
-    offset = sensirion_i2c_add_command8_to_buffer(communication_buffer, offset,
-                                                  SHT4X_SOFT_RESET_CMD_ID);
+    error = sensirion_i2c_add_command8_to_buffer(communication_buffer,
+                                                 sizeof(communication_buffer),
+                                                 &offset,
+                                                 SHT4X_SOFT_RESET_CMD_ID);
+    if (error != NO_ERROR) {
+        return error;
+    }
     error = sensirion_i2c_write_data(sht4x_i2c_address, communication_buffer,
                                      offset);
     if (error != NO_ERROR) {

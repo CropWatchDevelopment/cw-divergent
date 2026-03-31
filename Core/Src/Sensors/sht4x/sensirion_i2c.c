@@ -30,10 +30,17 @@ int8_t sensirion_i2c_check_crc(const uint8_t* data, uint16_t count,
     return NO_ERROR;
 }
 
-uint16_t sensirion_i2c_add_command8_to_buffer(uint8_t* buffer, uint16_t offset,
-                                              uint8_t command) {
-    buffer[offset++] = command;
-    return offset;
+int16_t sensirion_i2c_add_command8_to_buffer(uint8_t* buffer,
+                                             uint16_t buffer_size,
+                                             uint16_t* offset,
+                                             uint8_t command) {
+    if ((buffer == NULL) || (offset == NULL) || (*offset >= buffer_size)) {
+        return BYTE_NUM_ERROR;
+    }
+
+    buffer[*offset] = command;
+    (*offset)++;
+    return NO_ERROR;
 }
 
 int16_t sensirion_i2c_write_data(uint8_t address, const uint8_t* data,
@@ -46,6 +53,7 @@ int16_t sensirion_i2c_write_data(uint8_t address, const uint8_t* data,
 }
 
 int16_t sensirion_i2c_read_data_inplace(uint8_t address, uint8_t* buffer,
+                                        uint16_t buffer_size,
                                         uint16_t expected_data_length) {
     int16_t error;
     uint16_t i;
@@ -59,7 +67,7 @@ int16_t sensirion_i2c_read_data_inplace(uint8_t address, uint8_t* buffer,
 
     read_length = (expected_data_length / SENSIRION_WORD_SIZE) *
                   (SENSIRION_WORD_SIZE + CRC8_LEN);
-    if (read_length > UINT8_MAX) {
+    if ((read_length > UINT8_MAX) || (read_length > buffer_size)) {
         return BYTE_NUM_ERROR;
     }
 

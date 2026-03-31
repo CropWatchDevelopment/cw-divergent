@@ -2,6 +2,8 @@
 
 #include <stdbool.h>
 
+#include "app_safety.h"
+
 #define SLEEP_MANAGER_IWDG_RELOAD_MAX        0x0FFFU
 #define SLEEP_MANAGER_RTC_ASYNCH_PREDIV      127U
 #define SLEEP_MANAGER_RTC_LSE_SYNCH_PREDIV   255U
@@ -32,6 +34,7 @@ typedef struct
   volatile uint8_t wake_pending;
   volatile uint8_t external_wake_pending;
   volatile uint8_t lse_fault_pending;
+  volatile uint8_t stop_active;
   uint8_t lsi_wakeup_cycles;
   uint8_t initialized;
   SleepManagerRtcSource active_rtc_source;
@@ -46,7 +49,6 @@ static void sleep_manager_reset_backup_domain(void);
 static void sleep_manager_configure_run_clocks(void);
 static HAL_StatusTypeDef sleep_manager_set_lse_state(uint32_t lse_state);
 static void sleep_manager_clear_lse_css_flags(void);
-static void sleep_manager_init_watchdog(void);
 static void sleep_manager_enable_gpio_clocks(void);
 static void sleep_manager_disable_gpio_clocks(void);
 static void sleep_manager_configure_output(GPIO_TypeDef *port, uint16_t pin,
@@ -58,6 +60,8 @@ static void sleep_manager_restore_board_after_sleep(void);
 static HAL_StatusTypeDef sleep_manager_init_rtc(SleepManagerRtcSource source);
 static HAL_StatusTypeDef sleep_manager_select_rtc_clock(SleepManagerRtcSource source);
 static HAL_StatusTypeDef sleep_manager_switch_rtc_source(SleepManagerRtcSource source);
+static HAL_StatusTypeDef sleep_manager_restore_i2c_after_sleep(void);
+static void sleep_manager_recover_i2c_bus(void);
 static void sleep_manager_handle_lse_fault(void);
 static void sleep_manager_try_restore_lse(void);
 static void sleep_manager_wait_for_next_wake(void);
@@ -136,19 +140,6 @@ static void sleep_manager_clear_lse_css_flags(void)
 {
   __HAL_RCC_CLEAR_IT(RCC_IT_LSECSS);
   __HAL_RCC_LSECSS_EXTI_CLEAR_FLAG();
-}
-
-static void sleep_manager_init_watchdog(void)
-{
-  sleep_manager.iwdg->Instance = IWDG;
-  sleep_manager.iwdg->Init.Prescaler = IWDG_PRESCALER_256;
-  sleep_manager.iwdg->Init.Window = IWDG_WINDOW_DISABLE;
-  sleep_manager.iwdg->Init.Reload = SLEEP_MANAGER_IWDG_RELOAD_MAX;
-
-  if (HAL_IWDG_Init(sleep_manager.iwdg) != HAL_OK)
-  {
-    Error_Handler();
-  }
 }
 
 static void sleep_manager_enable_gpio_clocks(void)
@@ -248,19 +239,9 @@ static void sleep_manager_restore_board_after_sleep(void)
 
   if (sleep_manager.i2c != NULL)
   {
-    if (HAL_I2C_Init(sleep_manager.i2c) != HAL_OK)
+    if (sleep_manager_restore_i2c_after_sleep() != HAL_OK)
     {
-      Error_Handler();
-    }
-
-    if (HAL_I2CEx_ConfigAnalogFilter(sleep_manager.i2c, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
-    {
-      Error_Handler();
-    }
-
-    if (HAL_I2CEx_ConfigDigitalFilter(sleep_manager.i2c, 0U) != HAL_OK)
-    {
-      Error_Handler();
+      AppSafety_Fatal(APP_FATAL_REASON_I2C_RECOVERY_FAILED, 0U);
     }
   }
 }
@@ -397,12 +378,16 @@ void SleepManager_Init(RTC_HandleTypeDef *rtc, IWDG_HandleTypeDef *iwdg,
   sleep_manager.wake_pending = 0U;
   sleep_manager.external_wake_pending = 0U;
   sleep_manager.lse_fault_pending = 0U;
+  sleep_manager.stop_active = 0U;
   sleep_manager.lsi_wakeup_cycles = 0U;
   sleep_manager.cadence_cycles_total = 0U;
   sleep_manager.cadence_cycles_remaining = 0U;
 
   sleep_manager_configure_run_clocks();
-  sleep_manager_init_watchdog();
+  if (!AppSafety_IsWatchdogActive())
+  {
+    Error_Handler();
+  }
   SleepManager_FeedWatchdog();
 
   sleep_manager_reset_backup_domain();
@@ -443,18 +428,23 @@ static void sleep_manager_wait_for_next_wake(void)
       sleep_manager_handle_lse_fault();
     }
 
-    sleep_manager.wake_pending = 0U;
-    sleep_manager.external_wake_pending = 0U;
-    __HAL_PWR_CLEAR_FLAG(PWR_FLAG_WU);
+	    sleep_manager.wake_pending = 0U;
+	    sleep_manager.external_wake_pending = 0U;
+	    __HAL_PWR_CLEAR_FLAG(PWR_FLAG_WU);
 
-    HAL_SuspendTick();
-    HAL_PWREx_EnableUltraLowPower();
-    HAL_PWREx_EnableFastWakeUp();
-    HAL_PWR_EnterSTOPMode(PWR_MAINREGULATOR_ON, PWR_STOPENTRY_WFI);
-    HAL_ResumeTick();
+	    sleep_manager.stop_active = 1U;
+	    AppSafety_SetBootStage(APP_BOOT_STAGE_STOP_MODE);
+	    HAL_SuspendTick();
+	    HAL_PWREx_EnableUltraLowPower();
+	    HAL_PWREx_EnableFastWakeUp();
+	    HAL_PWR_EnterSTOPMode(PWR_MAINREGULATOR_ON, PWR_STOPENTRY_WFI);
+	    HAL_ResumeTick();
 
-    sleep_manager_configure_run_clocks();
-    SleepManager_FeedWatchdog();
+	    sleep_manager_configure_run_clocks();
+	    sleep_manager.stop_active = 0U;
+	    AppSafety_SetBootStage(APP_BOOT_STAGE_WAKE_RESUME);
+	    SleepManager_FeedWatchdog();
+	    AppSafety_SampleStackWatermark();
 
     if (sleep_manager.lse_fault_pending != 0U)
     {
@@ -533,6 +523,11 @@ void SleepManager_FeedWatchdog(void)
   }
 }
 
+bool SleepManager_IsStopWakeInProgress(void)
+{
+  return (sleep_manager.stop_active != 0U);
+}
+
 void SleepManager_HandleRtcInterrupt(void)
 {
   HAL_RCCEx_LSECSS_IRQHandler();
@@ -555,4 +550,76 @@ void HAL_RTCEx_WakeUpTimerEventCallback(RTC_HandleTypeDef *hrtc)
 void HAL_RCCEx_LSECSS_Callback(void)
 {
   sleep_manager.lse_fault_pending = 1U;
+}
+
+static HAL_StatusTypeDef sleep_manager_restore_i2c_after_sleep(void)
+{
+  if (HAL_I2C_Init(sleep_manager.i2c) == HAL_OK)
+  {
+    if ((HAL_I2CEx_ConfigAnalogFilter(sleep_manager.i2c,
+                                      I2C_ANALOGFILTER_ENABLE) == HAL_OK) &&
+        (HAL_I2CEx_ConfigDigitalFilter(sleep_manager.i2c, 0U) == HAL_OK))
+    {
+      return HAL_OK;
+    }
+  }
+
+  (void)HAL_I2C_DeInit(sleep_manager.i2c);
+  sleep_manager_recover_i2c_bus();
+
+  if (HAL_I2C_Init(sleep_manager.i2c) != HAL_OK)
+  {
+    return HAL_ERROR;
+  }
+
+  if (HAL_I2CEx_ConfigAnalogFilter(sleep_manager.i2c,
+                                   I2C_ANALOGFILTER_ENABLE) != HAL_OK)
+  {
+    return HAL_ERROR;
+  }
+
+  if (HAL_I2CEx_ConfigDigitalFilter(sleep_manager.i2c, 0U) != HAL_OK)
+  {
+    return HAL_ERROR;
+  }
+
+  return HAL_OK;
+}
+
+static void sleep_manager_recover_i2c_bus(void)
+{
+  GPIO_InitTypeDef gpio_init = {0};
+  uint32_t pulse_index;
+
+  sleep_manager_enable_gpio_clocks();
+
+  gpio_init.Pin = I2C1_SCL_Pin | I2C1_SDA_Pin;
+  gpio_init.Mode = GPIO_MODE_OUTPUT_OD;
+  gpio_init.Pull = GPIO_PULLUP;
+  gpio_init.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(I2C1_SCL_GPIO_Port, &gpio_init);
+
+  HAL_GPIO_WritePin(I2C1_SDA_GPIO_Port, I2C1_SDA_Pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(I2C1_SCL_GPIO_Port, I2C1_SCL_Pin, GPIO_PIN_SET);
+  HAL_Delay(1U);
+
+  for (pulse_index = 0U; pulse_index < 9U; ++pulse_index)
+  {
+    HAL_GPIO_WritePin(I2C1_SCL_GPIO_Port, I2C1_SCL_Pin, GPIO_PIN_RESET);
+    HAL_Delay(1U);
+    HAL_GPIO_WritePin(I2C1_SCL_GPIO_Port, I2C1_SCL_Pin, GPIO_PIN_SET);
+    HAL_Delay(1U);
+
+    if (HAL_GPIO_ReadPin(I2C1_SDA_GPIO_Port, I2C1_SDA_Pin) == GPIO_PIN_SET)
+    {
+      break;
+    }
+  }
+
+  HAL_GPIO_WritePin(I2C1_SDA_GPIO_Port, I2C1_SDA_Pin, GPIO_PIN_RESET);
+  HAL_Delay(1U);
+  HAL_GPIO_WritePin(I2C1_SCL_GPIO_Port, I2C1_SCL_Pin, GPIO_PIN_SET);
+  HAL_Delay(1U);
+  HAL_GPIO_WritePin(I2C1_SDA_GPIO_Port, I2C1_SDA_Pin, GPIO_PIN_SET);
+  HAL_Delay(1U);
 }

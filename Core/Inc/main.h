@@ -66,6 +66,10 @@ void Error_Handler(void);
 #define WD_DONE_GPIO_Port GPIOC
 #define I2C_ENABLE_Pin GPIO_PIN_5
 #define I2C_ENABLE_GPIO_Port GPIOB
+#define I2C1_SCL_Pin GPIO_PIN_6
+#define I2C1_SCL_GPIO_Port GPIOB
+#define I2C1_SDA_Pin GPIO_PIN_7
+#define I2C1_SDA_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
 

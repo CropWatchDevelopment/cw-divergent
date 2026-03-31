@@ -5,6 +5,8 @@
 extern "C" {
 #endif
 
+#include <stdbool.h>
+
 #include "main.h"
 
 #define SLEEP_MANAGER_WAKE_INTERVAL_S 15U
@@ -18,6 +20,7 @@ void SleepManager_Init(RTC_HandleTypeDef *rtc, IWDG_HandleTypeDef *iwdg,
                        I2C_HandleTypeDef *i2c);
 void SleepManager_SleepUntilWake(uint32_t sleep_minutes);
 void SleepManager_FeedWatchdog(void);
+bool SleepManager_IsStopWakeInProgress(void);
 
 /* Call from `RTC_IRQHandler()` inside `USER CODE BEGIN RTC_IRQn 0`. */
 void SleepManager_HandleRtcInterrupt(void);

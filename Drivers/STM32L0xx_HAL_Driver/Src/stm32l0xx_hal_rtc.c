@@ -1908,7 +1908,7 @@ uint8_t RTC_ByteToBcd2(uint8_t number)
   while (number >= 10U)
   {
     bcdhigh++;
-    number -= 10U;
+    number = (uint8_t)(number - 10U);
   }
 
   return ((uint8_t)(bcdhigh << 4U) | number);

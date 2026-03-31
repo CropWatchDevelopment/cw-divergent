@@ -9,6 +9,7 @@
 
 #include <string.h>
 
+#include "pm_wcs-3/pm_wcs3.h"
 #include "sht4x/sensirion_common.h"
 #include "sht4x/sensirion_i2c.h"
 #include "sht4x/sensirion_i2c_hal.h"
@@ -17,6 +18,7 @@
 #define SENSOR_DATA_SERIAL_REVALIDATE_INTERVAL 10U
 #define SENSOR_DATA_MIN_HUMIDITY_MILLI_PCT_RH  0
 #define SENSOR_DATA_MAX_HUMIDITY_MILLI_PCT_RH  100000
+#define SENSOR_DATA_SOIL_LABEL                 "PM-WCS-3-I2C"
 
 typedef struct {
     SensorDataSensorType type;
@@ -32,9 +34,15 @@ typedef struct {
 } SensorDataSlotState;
 
 typedef struct {
+    bool present;
+    int16_t last_error;
+} SensorDataSoilState;
+
+typedef struct {
     I2C_HandleTypeDef* i2c;
     bool inventory_initialized;
     SensorDataSlotState slots[SENSOR_DATA_SENSOR_SLOT_COUNT];
+    SensorDataSoilState soil;
 } SensorDataContext;
 
 static const SensorDataSlotConfig sensor_data_slot_configs[] = {
@@ -61,6 +69,10 @@ static void sensor_data_prepare_snapshot(SensorDataSnapshot* snapshot) {
 
     memset(snapshot, 0, sizeof(*snapshot));
     snapshot->sensor_count = SENSOR_DATA_SENSOR_SLOT_COUNT;
+    snapshot->soil.address = PM_WCS3_DEFAULT_ADDRESS;
+    snapshot->soil.label = SENSOR_DATA_SOIL_LABEL;
+    snapshot->soil.present = sensor_data.soil.present;
+    snapshot->soil.driver_error = sensor_data.soil.last_error;
 
     for (index = 0U; index < SENSOR_DATA_SENSOR_SLOT_COUNT; ++index) {
         snapshot->sensors[index].type = sensor_data_slot_configs[index].type;
@@ -88,6 +100,13 @@ static int16_t sensor_data_read_measurement(uint8_t address,
     return sht4x_measure_high_precision(temperature_mdeg_c, humidity_milli_pct_rh);
 }
 
+static void sensor_data_scan_soil_inventory(void) {
+    int16_t error = PMWCS3_Probe();
+
+    sensor_data.soil.last_error = error;
+    sensor_data.soil.present = (error == PM_WCS3_STATUS_OK);
+}
+
 static void sensor_data_scan_inventory(void) {
     uint8_t index;
 
@@ -108,6 +127,7 @@ static void sensor_data_scan_inventory(void) {
         }
     }
 
+    sensor_data_scan_soil_inventory();
     sensor_data.inventory_initialized = true;
 }
 
@@ -149,6 +169,7 @@ void SensorData_Init(I2C_HandleTypeDef* hi2c) {
     memset(&sensor_data, 0, sizeof(sensor_data));
     sensor_data.i2c = hi2c;
 
+    PMWCS3_Init(hi2c, PM_WCS3_DEFAULT_ADDRESS);
     sensirion_i2c_hal_set_handle(hi2c);
     sensirion_i2c_hal_init();
 }
@@ -178,7 +199,9 @@ SensorDataStatus SensorData_ReadAll(SensorDataSnapshot* snapshot) {
 
     sensor_data_prepare_snapshot(snapshot);
     if (snapshot->present_count == 0U) {
-        return SENSOR_DATA_STATUS_NO_SENSORS;
+        if (!snapshot->soil.present) {
+            return SENSOR_DATA_STATUS_NO_SENSORS;
+        }
     }
 
     for (index = 0U; index < SENSOR_DATA_SENSOR_SLOT_COUNT; ++index) {
@@ -229,6 +252,21 @@ SensorDataStatus SensorData_ReadAll(SensorDataSnapshot* snapshot) {
         }
 
         sensor_slot->serial_number = sensor_state->serial_number;
+    }
+
+    if (sensor_data.soil.present) {
+        PMWCS3Reading soil_reading = {0};
+        int16_t soil_error = PMWCS3_Read(&soil_reading);
+
+        sensor_data.soil.last_error = soil_error;
+        snapshot->soil.driver_error = soil_error;
+        if (soil_error == PM_WCS3_STATUS_OK) {
+            snapshot->soil.sample_valid = true;
+            snapshot->soil.e25_x100 = soil_reading.e25_x100;
+            snapshot->soil.ec_uS_cm = soil_reading.ec_uS_cm;
+            snapshot->soil.temperature_c_x100 = soil_reading.temperature_c_x100;
+            snapshot->soil.vwc_pct_x10 = soil_reading.vwc_pct_x10;
+        }
     }
 
     sensor_data_apply_user_math(snapshot);

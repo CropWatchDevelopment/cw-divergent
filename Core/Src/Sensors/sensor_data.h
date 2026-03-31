@@ -42,10 +42,23 @@ typedef struct {
 } SensorDataSensor;
 
 typedef struct {
+    bool present;
+    bool sample_valid;
+    uint8_t address;
+    const char* label;
+    int16_t e25_x100;
+    uint16_t ec_uS_cm;
+    int16_t temperature_c_x100;
+    uint16_t vwc_pct_x10;
+    int16_t driver_error;
+} SensorDataSoil;
+
+typedef struct {
     uint8_t present_count;
     uint8_t sensor_count;
     bool serials_revalidated_on_this_read;
     SensorDataSensor sensors[SENSOR_DATA_SENSOR_SLOT_COUNT];
+    SensorDataSoil soil;
 } SensorDataSnapshot;
 
 void SensorData_Init(I2C_HandleTypeDef* hi2c);

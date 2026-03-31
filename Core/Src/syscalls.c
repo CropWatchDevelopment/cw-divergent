@@ -30,6 +30,8 @@
 #include <sys/time.h>
 #include <sys/times.h>
 
+#include "app_safety.h"
+
 
 /* Variables */
 extern int __io_putchar(int ch) __attribute__((weak));
@@ -61,7 +63,7 @@ int _kill(int pid, int sig)
 void _exit (int status)
 {
   _kill(status, -1);
-  while (1) {}    /* Make sure we hang here */
+  AppSafety_Fatal(APP_FATAL_REASON_EXIT, 0U);
 }
 
 __attribute__((weak)) int _read(int file, char *ptr, int len)
@@ -71,13 +73,13 @@ __attribute__((weak)) int _read(int file, char *ptr, int len)
 
   for (DataIdx = 0; DataIdx < len; DataIdx++)
   {
-    *ptr++ = __io_getchar();
+    *ptr++ = (char)__io_getchar();
   }
 
   return len;
 }
 
-__attribute__((weak)) int _write(int file, char *ptr, int len)
+__attribute__((weak)) int _write(int file, const char *ptr, int len)
 {
   (void)file;
   int DataIdx;
