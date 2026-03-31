@@ -1,5 +1,6 @@
 TTN/TTI Decoder:
 
+```javascript
 function decodeUplink(input) {
   var data = {
     error: null // keep explicit for consistency
@@ -343,3 +344,4 @@ function Decoder(bytes, port) {
   var result = decodeUplink({ bytes: bytes, fPort: port });
   return result.data;
 }
+```
