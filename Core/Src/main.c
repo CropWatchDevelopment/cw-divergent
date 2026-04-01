@@ -21,6 +21,8 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <limits.h>
+
 #include "Sensors/sensor_data.h"
 #include "app_safety.h"
 #include "radio/RM126x.h"
@@ -202,12 +204,34 @@ static uint16_t App_HumidityToWire(int32_t humidity_milli_pct_rh)
 
 static int16_t App_T1TemperatureToWire(int32_t temperature_mdeg_c)
 {
-  return (int16_t)((temperature_mdeg_c / 10) + 5500);
+  int32_t wire = (temperature_mdeg_c / 10) + 5500;
+
+  if (wire < INT16_MIN)
+  {
+    wire = INT16_MIN;
+  }
+  else if (wire > INT16_MAX)
+  {
+    wire = INT16_MAX;
+  }
+
+  return (int16_t)wire;
 }
 
 static int16_t App_T2TemperatureToWire(int32_t temperature_mdeg_c)
 {
-  return (int16_t)(temperature_mdeg_c / 10);
+  int32_t wire = temperature_mdeg_c / 10;
+
+  if (wire < INT16_MIN)
+  {
+    wire = INT16_MIN;
+  }
+  else if (wire > INT16_MAX)
+  {
+    wire = INT16_MAX;
+  }
+
+  return (int16_t)wire;
 }
 
 static void App_BuildNormalPayload(const SensorDataSnapshot *snapshot,
@@ -385,6 +409,7 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     AppSafety_SampleStackWatermark();
+    App_FeedWatchdog();
     HAL_GPIO_WritePin(WD_DONE_GPIO_Port, WD_DONE_Pin, GPIO_PIN_SET);
     (void)RM126x_HostUartResume(&g_rm126x);
 
@@ -469,6 +494,7 @@ int main(void)
       }
 
       HAL_GPIO_WritePin(I2C_ENABLE_GPIO_Port, I2C_ENABLE_Pin, GPIO_PIN_RESET);
+      App_FeedWatchdog();
 
       if (RM126x_WakeAndPing(&g_rm126x) == RM126X_RESULT_OK)
       {
@@ -498,6 +524,7 @@ int main(void)
       HAL_GPIO_WritePin(I2C_ENABLE_GPIO_Port, I2C_ENABLE_Pin, GPIO_PIN_RESET);
     }
 
+    App_FeedWatchdog();
     (void)RM126x_HostUartSuspend(&g_rm126x);
     HAL_GPIO_WritePin(WD_DONE_GPIO_Port, WD_DONE_Pin, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(I2C_ENABLE_GPIO_Port, I2C_ENABLE_Pin, GPIO_PIN_RESET);

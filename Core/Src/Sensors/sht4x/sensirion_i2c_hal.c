@@ -72,6 +72,8 @@ int8_t sensirion_i2c_hal_write(uint8_t address, const uint8_t* data,
 
 void sensirion_i2c_hal_sleep_usec(uint32_t useconds) {
     uint32_t delay_ms;
+    uint32_t start_tick;
+    uint32_t hard_limit_ms;
 
     if (useconds == 0U) {
         return;
@@ -82,5 +84,17 @@ void sensirion_i2c_hal_sleep_usec(uint32_t useconds) {
         delay_ms++;
     }
 
-    HAL_Delay(delay_ms);
+    /* Guard: if SysTick is stalled HAL_Delay never returns.
+     * Poll HAL_GetTick and bail out after 2x the requested time. */
+    hard_limit_ms = delay_ms * 2U;
+    if (hard_limit_ms < 10U) {
+        hard_limit_ms = 10U;
+    }
+
+    start_tick = HAL_GetTick();
+    while ((HAL_GetTick() - start_tick) < delay_ms) {
+        if ((HAL_GetTick() - start_tick) >= hard_limit_ms) {
+            break;  /* SysTick may be stalled — do not hang */
+        }
+    }
 }
