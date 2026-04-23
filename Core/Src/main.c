@@ -816,7 +816,13 @@ static void MX_GPIO_Init(void)
   HAL_NVIC_EnableIRQ(EXTI0_1_IRQn);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
-
+  /* ES0292 2.1.11: PC13 transitions can disturb the LSE crystal on LQFP
+   * packages. PC13 is unused on this board; park it in analog mode with no
+   * pull so no noise edge can propagate to the LSE domain. */
+  GPIO_InitStruct.Pin = GPIO_PIN_13;
+  GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
   /* USER CODE END MX_GPIO_Init_2 */
 }
 

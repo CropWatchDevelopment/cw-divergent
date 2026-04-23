@@ -194,6 +194,11 @@ void AppSafety_Fatal(AppFatalReason reason, uint32_t return_address)
   app_safety_request_reset();
 }
 
+void AppSafety_FatalSpuriousIrq(void)
+{
+  AppSafety_Fatal(APP_FATAL_REASON_SPURIOUS_IRQ, 0U);
+}
+
 void AppSafety_HandleNmi(uint32_t* stack_frame)
 {
   uint32_t sp = (uint32_t)(uintptr_t)stack_frame;

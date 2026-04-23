@@ -107,8 +107,11 @@ LoopForever:
 */
     .section  .text.Default_Handler,"ax",%progbits
 Default_Handler:
-Infinite_Loop:
-  b  Infinite_Loop
+  /* Any unhandled IRQ tail-calls AppSafety_FatalSpuriousIrq, which records
+   * the reason in the .noinit fault record and issues NVIC_SystemReset.
+   * Avoids the classic "spin forever until IWDG" silent hang. */
+  ldr  r0, =AppSafety_FatalSpuriousIrq
+  bx   r0
   .size  Default_Handler, .-Default_Handler
 /******************************************************************************
 *

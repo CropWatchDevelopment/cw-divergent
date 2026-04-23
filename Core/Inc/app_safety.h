@@ -30,7 +30,8 @@ typedef enum
   APP_FATAL_REASON_NMI,
   APP_FATAL_REASON_HARDFAULT,
   APP_FATAL_REASON_EXIT,
-  APP_FATAL_REASON_I2C_RECOVERY_FAILED
+  APP_FATAL_REASON_I2C_RECOVERY_FAILED,
+  APP_FATAL_REASON_SPURIOUS_IRQ
 } AppFatalReason;
 
 typedef struct
@@ -66,6 +67,7 @@ const AppFaultRecord* AppSafety_GetFaultRecord(void);
 
 void AppSafety_Fatal(AppFatalReason reason, uint32_t return_address)
     __attribute__((noreturn));
+void AppSafety_FatalSpuriousIrq(void) __attribute__((noreturn));
 void AppSafety_HandleNmi(uint32_t* stack_frame) __attribute__((noreturn));
 void AppSafety_HandleHardFault(uint32_t* stack_frame) __attribute__((noreturn));
 

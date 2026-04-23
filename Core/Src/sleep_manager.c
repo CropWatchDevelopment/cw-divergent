@@ -434,6 +434,9 @@ static void sleep_manager_wait_for_next_wake(void)
 
 	    sleep_manager.stop_active = 1U;
 	    AppSafety_SetBootStage(APP_BOOT_STAGE_STOP_MODE);
+	    /* Refresh IWDG just before STOP so the full IWDG window covers
+	     * (STOP duration + post-wake clock restore + next feed). */
+	    SleepManager_FeedWatchdog();
 	    HAL_SuspendTick();
 	    HAL_PWREx_EnableUltraLowPower();
 	    HAL_PWREx_EnableFastWakeUp();

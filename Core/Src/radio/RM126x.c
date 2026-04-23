@@ -217,8 +217,12 @@ static RM126xResult rm126x_uart_enable(RM126xHandle* handle) {
 }
 
 static void rm126x_uart_flush_rx(USART_TypeDef* uart) {
+    uint32_t start_tick = HAL_GetTick();
     while ((uart->ISR & USART_ISR_RXNE) != 0UL) {
         (void)uart->RDR;
+        if ((uint32_t)(HAL_GetTick() - start_tick) >= 50UL) {
+            break;
+        }
     }
     rm126x_clear_uart_errors(uart);
 }

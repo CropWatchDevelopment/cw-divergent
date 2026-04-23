@@ -182,7 +182,10 @@ void RCC_CRS_IRQHandler(void)
 void EXTI0_1_IRQHandler(void)
 {
   /* USER CODE BEGIN EXTI0_1_IRQn 0 */
-
+  /* EXTI line 0 is shared with line 1 on the same NVIC vector. If anything
+   * ever latches a pending bit on line 0 (stray noise, rework, future pin
+   * use), service it here so the IRQ does not re-fire forever. */
+  HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_0);
   /* USER CODE END EXTI0_1_IRQn 0 */
   HAL_GPIO_EXTI_IRQHandler(PULSE_IN_Pin);
   /* USER CODE BEGIN EXTI0_1_IRQn 1 */
