@@ -35,7 +35,8 @@ typedef struct
   volatile uint8_t external_wake_pending;
   volatile uint8_t lse_fault_pending;
   volatile uint8_t stop_active;
-  uint8_t lsi_wakeup_cycles;
+  uint16_t lsi_wakeup_cycles;
+  uint16_t lse_retry_threshold;
   uint8_t initialized;
   SleepManagerRtcSource active_rtc_source;
   uint32_t cadence_cycles_total;
@@ -64,6 +65,7 @@ static HAL_StatusTypeDef sleep_manager_restore_i2c_after_sleep(void);
 static void sleep_manager_recover_i2c_bus(void);
 static void sleep_manager_handle_lse_fault(void);
 static void sleep_manager_try_restore_lse(void);
+static uint16_t sleep_manager_next_lse_backoff(uint16_t current);
 static void sleep_manager_wait_for_next_wake(void);
 
 static void sleep_manager_prepare_backup_domain(void)
@@ -331,34 +333,109 @@ static void sleep_manager_handle_lse_fault(void)
 {
   sleep_manager.lse_fault_pending = 0U;
   sleep_manager.lsi_wakeup_cycles = 0U;
+  sleep_manager.lse_retry_threshold = SLEEP_MANAGER_LSE_RETRY_CYCLES;
 
+  /* Disable CSS and clear pending flags before tearing down LSE state, so
+   * the CSS flag won't immediately re-fire while we transition. */
   HAL_RCCEx_DisableLSECSS();
   sleep_manager_clear_lse_css_flags();
 
-  if (sleep_manager_switch_rtc_source(SLEEP_MANAGER_RTC_SOURCE_LSI) != HAL_OK)
+  /* Force a backup-domain reset to clear LSEON/LSERDY/LSEBYP and any latched
+   * CSS state in hardware. This avoids the polling LSERDY-clear inside
+   * HAL_RCC_OscConfig(LSE_OFF), which can spend up to LSE_STARTUP_TIMEOUT
+   * (5 s) waiting on a misbehaving oscillator. The IWDG window is ~28 s on
+   * LSI, so feed the watchdog around the transition for headroom. */
+  SleepManager_FeedWatchdog();
+  sleep_manager_reset_backup_domain();
+
+  /* LSI is unaffected by the backup-domain reset. Configure it as the RTC
+   * clock source and re-init RTC + wakeup timer. We call select_rtc_clock
+   * directly rather than switch_rtc_source so we do not invoke the LSE
+   * polling path. */
+  if (sleep_manager_select_rtc_clock(SLEEP_MANAGER_RTC_SOURCE_LSI) != HAL_OK)
   {
     Error_Handler();
   }
+
+  SleepManager_FeedWatchdog();
+}
+
+static uint16_t sleep_manager_next_lse_backoff(uint16_t current)
+{
+  uint32_t doubled;
+
+  if (current == 0U)
+  {
+    return SLEEP_MANAGER_LSE_RETRY_CYCLES;
+  }
+
+  doubled = (uint32_t)current * 2U;
+  if (doubled > (uint32_t)SLEEP_MANAGER_LSE_RETRY_BACKOFF_MAX_CYCLES)
+  {
+    return SLEEP_MANAGER_LSE_RETRY_BACKOFF_MAX_CYCLES;
+  }
+  return (uint16_t)doubled;
 }
 
 static void sleep_manager_try_restore_lse(void)
 {
-  HAL_StatusTypeDef status;
+  /* Always clear the wake counter so a failed retry doesn't immediately
+   * re-fire on the next wake. */
+  sleep_manager.lsi_wakeup_cycles = 0U;
 
-  status = sleep_manager_switch_rtc_source(SLEEP_MANAGER_RTC_SOURCE_LSE);
-  if (status == HAL_OK)
+  /* The LSE startup poll inside HAL_RCC_OscConfig can block up to
+   * LSE_STARTUP_TIMEOUT (5 s). The IWDG window at LSI 37 kHz / prescaler 256
+   * / reload 4095 is ~28 s, which is enough but not generously so. Feed the
+   * watchdog around each potentially-long step. */
+  SleepManager_FeedWatchdog();
+
+  /* Force a fresh backup-domain reset before retrying. This clears any
+   * latched LSE/CSS state in BDCR without polling LSERDY (the poll inside
+   * HAL_RCC_OscConfig(LSE_OFF) can hang on a misbehaving LSE). The HAL's
+   * internal reset inside HAL_RCCEx_PeriphCLKConfig only fires when the RTC
+   * source actually changes, so we cannot rely on it here when we may be
+   * staying on LSI after a failed retry. */
+  sleep_manager_clear_lse_css_flags();
+  sleep_manager_reset_backup_domain();
+
+  /* Backup reset cleared LSEON; bring LSE up fresh. */
+  if (sleep_manager_set_lse_state(RCC_LSE_ON) != HAL_OK)
   {
-    sleep_manager.lsi_wakeup_cycles = 0U;
+    /* LSE still not ready. Stay on LSI, back off, and re-arm RTC against
+     * LSI since the backup-domain reset wiped the prior RTC config. */
+    SleepManager_FeedWatchdog();
+    sleep_manager.lse_retry_threshold =
+        sleep_manager_next_lse_backoff(sleep_manager.lse_retry_threshold);
+
+    if (sleep_manager_set_lse_state(RCC_LSE_OFF) != HAL_OK)
+    {
+      Error_Handler();
+    }
+    if (sleep_manager_select_rtc_clock(SLEEP_MANAGER_RTC_SOURCE_LSI) != HAL_OK)
+    {
+      Error_Handler();
+    }
     return;
   }
 
-  sleep_manager.lsi_wakeup_cycles = 0U;
-  sleep_manager_clear_lse_css_flags();
-
-  if (sleep_manager_set_lse_state(RCC_LSE_OFF) != HAL_OK)
+  /* LSE is up — switch RTC clock to LSE and re-init RTC + wakeup timer. */
+  SleepManager_FeedWatchdog();
+  if (sleep_manager_select_rtc_clock(SLEEP_MANAGER_RTC_SOURCE_LSE) != HAL_OK)
   {
-    Error_Handler();
+    /* RTC switch failed even though LSE locked. Fall back to LSI and back
+     * off so we don't thrash. */
+    sleep_manager.lse_retry_threshold =
+        sleep_manager_next_lse_backoff(sleep_manager.lse_retry_threshold);
+    if (sleep_manager_select_rtc_clock(SLEEP_MANAGER_RTC_SOURCE_LSI) != HAL_OK)
+    {
+      Error_Handler();
+    }
+    return;
   }
+
+  /* Successfully restored. Reset the backoff so a future fault retries at
+   * the initial cadence. */
+  sleep_manager.lse_retry_threshold = SLEEP_MANAGER_LSE_RETRY_CYCLES;
 }
 
 void SleepManager_Init(RTC_HandleTypeDef *rtc, IWDG_HandleTypeDef *iwdg,
@@ -380,6 +457,7 @@ void SleepManager_Init(RTC_HandleTypeDef *rtc, IWDG_HandleTypeDef *iwdg,
   sleep_manager.lse_fault_pending = 0U;
   sleep_manager.stop_active = 0U;
   sleep_manager.lsi_wakeup_cycles = 0U;
+  sleep_manager.lse_retry_threshold = SLEEP_MANAGER_LSE_RETRY_CYCLES;
   sleep_manager.cadence_cycles_total = 0U;
   sleep_manager.cadence_cycles_remaining = 0U;
 
@@ -468,7 +546,7 @@ static void sleep_manager_wait_for_next_wake(void)
         (handled_lse_fault == false))
     {
       sleep_manager.lsi_wakeup_cycles++;
-      if (sleep_manager.lsi_wakeup_cycles >= SLEEP_MANAGER_LSE_RETRY_CYCLES)
+      if (sleep_manager.lsi_wakeup_cycles >= sleep_manager.lse_retry_threshold)
       {
         sleep_manager_try_restore_lse();
       }

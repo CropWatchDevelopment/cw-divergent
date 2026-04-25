@@ -10,7 +10,12 @@ extern "C" {
 #include "main.h"
 
 #define SLEEP_MANAGER_WAKE_INTERVAL_S 10U
-#define SLEEP_MANAGER_LSE_RETRY_CYCLES 3U
+/* Initial cadence for retrying LSE after falling back to LSI. Counted in
+ * wake cycles, so 30 * 10s = 5 min between the first few attempts. Repeated
+ * failures double this up to SLEEP_MANAGER_LSE_RETRY_BACKOFF_MAX_CYCLES so a
+ * dead crystal doesn't burn power retrying every wake. */
+#define SLEEP_MANAGER_LSE_RETRY_CYCLES 30U
+#define SLEEP_MANAGER_LSE_RETRY_BACKOFF_MAX_CYCLES 360U
 #define SLEEP_MANAGER_MAX_SLEEP_MINUTES 60U
 
 /* Call from `main()` inside `USER CODE BEGIN 2` after CubeMX peripheral init.
