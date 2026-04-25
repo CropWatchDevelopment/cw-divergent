@@ -23,7 +23,9 @@ extern "C" {
 
 #define RM126X_FPORT_NORMAL                 1U
 #define RM126X_FPORT_SOIL                   2U
-#define RM126X_FPORT_PULSE_COUNT            3U
+#define RM126X_FPORT_CO2                    3U
+#define RM126X_FPORT_AS7341                 4U
+#define RM126X_FPORT_PULSE_COUNT            8U
 #define RM126X_FPORT_DIAGNOSTIC             9U
 #define RM126X_FPORT_ERROR                  10U
 #define RM126X_FPORT_SENSOR_MISMATCH        11U

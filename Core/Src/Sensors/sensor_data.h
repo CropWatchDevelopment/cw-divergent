@@ -15,6 +15,9 @@
 
 #define SENSOR_DATA_MIN_POWERUP_DELAY_MS 2U
 #define SENSOR_DATA_SENSOR_SLOT_COUNT    2U
+#define SENSOR_DATA_SCD41_SERIAL_WORD_COUNT 3U
+
+typedef void (*SensorDataDelayMsCallback)(uint32_t delay_ms);
 
 typedef enum {
     SENSOR_TYPE_NONE = 0,
@@ -54,14 +57,30 @@ typedef struct {
 } SensorDataSoil;
 
 typedef struct {
+    bool present;
+    bool sample_valid;
+    uint8_t address;
+    const char* label;
+    uint16_t co2_ppm;
+    int32_t temperature_mdeg_c;
+    uint8_t humidity_pct;
+    uint16_t serial_words[SENSOR_DATA_SCD41_SERIAL_WORD_COUNT];
+    bool serial_revalidated;
+    bool serial_changed;
+    int16_t driver_error;
+} SensorDataScd41;
+
+typedef struct {
     uint8_t present_count;
     uint8_t sensor_count;
     bool serials_revalidated_on_this_read;
     SensorDataSensor sensors[SENSOR_DATA_SENSOR_SLOT_COUNT];
     SensorDataSoil soil;
+    SensorDataScd41 scd41;
 } SensorDataSnapshot;
 
 void SensorData_Init(I2C_HandleTypeDef* hi2c);
+void SensorData_SetDelayMsCallback(SensorDataDelayMsCallback callback);
 
 /* Caller must power the sensor rail and wait at least
  * SENSOR_DATA_MIN_POWERUP_DELAY_MS before calling scan/read.

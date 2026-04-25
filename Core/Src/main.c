@@ -22,6 +22,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <limits.h>
+#include <stddef.h>
 
 #include "Sensors/sensor_data.h"
 #include "app_safety.h"
@@ -32,6 +33,22 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+typedef enum
+{
+  APP_SENSOR_FAMILY_SHT4X = 0,
+  APP_SENSOR_FAMILY_SOIL,
+  APP_SENSOR_FAMILY_SCD41,
+  APP_SENSOR_FAMILY_AS7341,
+  APP_SENSOR_FAMILY_COUNT
+} AppSensorFamily;
+
+typedef struct
+{
+  uint8_t fport;
+  size_t length;
+  bool is_sensor_family;
+  AppSensorFamily sensor_family;
+} AppTxFrame;
 
 /* USER CODE END PTD */
 
@@ -40,14 +57,46 @@
 #define APP_SLEEP_MINUTES_PER_SLOT 10U
 #define APP_INITIAL_SEND_RETRY_DELAY_MS 1000U
 #define APP_SENSOR_POWER_UP_DELAY_MS 300U
+#define APP_SENSOR_DELAY_CHUNK_MS 250U
 #define APP_PULSE_DEBOUNCE_MS 50U
 #define APP_SENSOR_TEMP_DELTA_LIMIT_MDEG_C 500
 #define APP_SENSOR_HUMIDITY_DELTA_LIMIT_MPCT_RH 5000
+#define APP_TX_PAYLOAD_MAX_BYTES 11U
+
+#define APP_PAYLOAD_LEN_SHT_NORMAL 4U
+#define APP_PAYLOAD_LEN_SOIL 8U
+#define APP_PAYLOAD_LEN_SCD41 5U
+#define APP_PAYLOAD_LEN_PULSE_COUNT 4U
+#define APP_PAYLOAD_LEN_DIAGNOSTIC 9U
+#define APP_PAYLOAD_LEN_SHT_MISMATCH 8U
+#define APP_PAYLOAD_LEN_ERROR 1U
 
 #define APP_ERROR_NO_SENSOR 0x01U
 #define APP_ERROR_SENSOR1_FAILURE 0x02U
 #define APP_ERROR_SENSOR2_FAILURE 0x03U
 #define APP_ERROR_HUMIDITY_VALIDATION 0x05U
+
+#if APP_PAYLOAD_LEN_SHT_NORMAL > APP_TX_PAYLOAD_MAX_BYTES
+#error "SHT4x normal payload exceeds app payload limit"
+#endif
+#if APP_PAYLOAD_LEN_SOIL > APP_TX_PAYLOAD_MAX_BYTES
+#error "Soil payload exceeds app payload limit"
+#endif
+#if APP_PAYLOAD_LEN_SCD41 > APP_TX_PAYLOAD_MAX_BYTES
+#error "SCD41 payload exceeds app payload limit"
+#endif
+#if APP_PAYLOAD_LEN_PULSE_COUNT > APP_TX_PAYLOAD_MAX_BYTES
+#error "Pulse-count payload exceeds app payload limit"
+#endif
+#if APP_PAYLOAD_LEN_DIAGNOSTIC > APP_TX_PAYLOAD_MAX_BYTES
+#error "Diagnostic payload exceeds app payload limit"
+#endif
+#if APP_PAYLOAD_LEN_SHT_MISMATCH > APP_TX_PAYLOAD_MAX_BYTES
+#error "SHT4x mismatch payload exceeds app payload limit"
+#endif
+#if APP_PAYLOAD_LEN_ERROR > APP_TX_PAYLOAD_MAX_BYTES
+#error "Error payload exceeds app payload limit"
+#endif
 
 /* USER CODE END PD */
 
@@ -92,6 +141,7 @@ static volatile uint32_t g_pulse_counter = 0;
 static volatile bool g_pulse_uplink_pending = false;
 static uint32_t g_last_pulse_tick_ms = 0U;
 static bool g_pulse_debounce_armed = false;
+static AppSensorFamily g_next_sensor_family = APP_SENSOR_FAMILY_SHT4X;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -103,8 +153,20 @@ static void MX_I2C1_Init(void);
 static void MX_USART2_UART_Init(void);
 /* USER CODE BEGIN PFP */
 static void App_FeedWatchdog(void);
+static void App_SensorDelayMs(uint32_t delay_ms);
 static uint8_t App_CaptureResetReasonCode(void);
 static bool App_IsSensorValid(const SensorDataSensor *sensor);
+static bool App_IsShtFamilyValid(const SensorDataSnapshot *snapshot);
+static bool App_IsShtTemperatureMismatch(const SensorDataSnapshot *snapshot);
+static bool App_IsSoilValid(const SensorDataSnapshot *snapshot);
+static bool App_IsScd41Valid(const SensorDataSnapshot *snapshot);
+static bool App_IsSensorFamilyAvailable(AppSensorFamily family,
+                                        const SensorDataSnapshot *snapshot);
+static AppSensorFamily App_NextSensorFamily(AppSensorFamily family);
+static void App_AdvanceSensorFamilyRotation(AppSensorFamily sent_family);
+static bool App_SetTxFrame(AppTxFrame *frame, uint8_t fport, size_t length,
+                           bool is_sensor_family,
+                           AppSensorFamily sensor_family);
 static void App_PackU16BE(uint8_t *buffer, uint16_t value);
 static void App_PackU32BE(uint8_t *buffer, uint32_t value);
 static uint16_t App_HumidityToWire(int32_t humidity_milli_pct_rh);
@@ -114,6 +176,8 @@ static void App_BuildNormalPayload(const SensorDataSnapshot *snapshot,
                                    uint8_t *payload);
 static void App_BuildSoilPayload(const SensorDataSnapshot *snapshot,
                                  uint8_t *payload);
+static void App_BuildScd41Payload(const SensorDataSnapshot *snapshot,
+                                  uint8_t *payload);
 static void App_BuildDiagnosticPayload(const SensorDataSnapshot *snapshot,
                                        uint8_t reset_reason_code,
                                        uint8_t *payload);
@@ -121,6 +185,9 @@ static void App_BuildPulseCountPayload(uint32_t pulse_count, uint8_t *payload);
 static void App_BuildMismatchPayload(const SensorDataSnapshot *snapshot,
                                      uint8_t *payload);
 static void App_BuildErrorPayload(uint8_t error_code, uint8_t *payload);
+static bool App_BuildRotatingSensorPayload(const SensorDataSnapshot *snapshot,
+                                           uint8_t *payload,
+                                           AppTxFrame *frame);
 static uint8_t App_SelectErrorCode(const SensorDataSnapshot *snapshot);
 /* USER CODE END PFP */
 
@@ -131,6 +198,23 @@ static void App_FeedWatchdog(void)
   if (AppSafety_IsWatchdogActive() && (HAL_IWDG_Refresh(&hiwdg) != HAL_OK))
   {
     Error_Handler();
+  }
+}
+
+static void App_SensorDelayMs(uint32_t delay_ms)
+{
+  uint32_t remaining_ms = delay_ms;
+
+  App_FeedWatchdog();
+  while (remaining_ms > 0U)
+  {
+    uint32_t chunk_ms = (remaining_ms > APP_SENSOR_DELAY_CHUNK_MS)
+                            ? APP_SENSOR_DELAY_CHUNK_MS
+                            : remaining_ms;
+
+    HAL_Delay(chunk_ms);
+    remaining_ms -= chunk_ms;
+    App_FeedWatchdog();
   }
 }
 
@@ -171,6 +255,100 @@ static uint8_t App_CaptureResetReasonCode(void)
 static bool App_IsSensorValid(const SensorDataSensor *sensor)
 {
   return (sensor != NULL) && sensor->present && (sensor->driver_error == 0);
+}
+
+static bool App_IsShtFamilyValid(const SensorDataSnapshot *snapshot)
+{
+  return (snapshot != NULL) && App_IsSensorValid(&snapshot->sensors[0]) &&
+         App_IsSensorValid(&snapshot->sensors[1]);
+}
+
+static bool App_IsShtTemperatureMismatch(const SensorDataSnapshot *snapshot)
+{
+  int32_t temperature_delta;
+
+  if (!App_IsShtFamilyValid(snapshot))
+  {
+    return false;
+  }
+
+  /* Legacy SHT4x path: only the paired SHT sensors participate in this
+   * mismatch check. SCD41 temperature is intentionally excluded. */
+  temperature_delta = snapshot->sensors[0].temperature_mdeg_c -
+                      snapshot->sensors[1].temperature_mdeg_c;
+  if (temperature_delta < 0)
+  {
+    temperature_delta = -temperature_delta;
+  }
+
+  return (temperature_delta > APP_SENSOR_TEMP_DELTA_LIMIT_MDEG_C);
+}
+
+static bool App_IsSoilValid(const SensorDataSnapshot *snapshot)
+{
+  return (snapshot != NULL) && snapshot->soil.present &&
+         snapshot->soil.sample_valid && (snapshot->soil.driver_error == 0);
+}
+
+static bool App_IsScd41Valid(const SensorDataSnapshot *snapshot)
+{
+  return (snapshot != NULL) && snapshot->scd41.present &&
+         snapshot->scd41.sample_valid && (snapshot->scd41.driver_error == 0);
+}
+
+static bool App_IsSensorFamilyAvailable(AppSensorFamily family,
+                                        const SensorDataSnapshot *snapshot)
+{
+  switch (family)
+  {
+  case APP_SENSOR_FAMILY_SHT4X:
+    return App_IsShtFamilyValid(snapshot);
+  case APP_SENSOR_FAMILY_SOIL:
+    return App_IsSoilValid(snapshot);
+  case APP_SENSOR_FAMILY_SCD41:
+    return App_IsScd41Valid(snapshot);
+  case APP_SENSOR_FAMILY_AS7341:
+    /* AS7341 reserved/future: fPort 4 exists, but this phase never emits it. */
+    return false;
+  default:
+    return false;
+  }
+}
+
+static AppSensorFamily App_NextSensorFamily(AppSensorFamily family)
+{
+  uint8_t next_family = (uint8_t)family;
+
+  next_family++;
+
+  if (next_family >= (uint8_t)APP_SENSOR_FAMILY_COUNT)
+  {
+    next_family = 0U;
+  }
+
+  return (AppSensorFamily)next_family;
+}
+
+static void App_AdvanceSensorFamilyRotation(AppSensorFamily sent_family)
+{
+  g_next_sensor_family = App_NextSensorFamily(sent_family);
+}
+
+static bool App_SetTxFrame(AppTxFrame *frame, uint8_t fport, size_t length,
+                           bool is_sensor_family,
+                           AppSensorFamily sensor_family)
+{
+  if ((frame == NULL) || (length > APP_TX_PAYLOAD_MAX_BYTES))
+  {
+    return false;
+  }
+
+  frame->fport = fport;
+  frame->length = length;
+  frame->is_sensor_family = is_sensor_family;
+  frame->sensor_family = sensor_family;
+
+  return true;
 }
 
 static void App_PackU16BE(uint8_t *buffer, uint16_t value)
@@ -253,6 +431,17 @@ static void App_BuildSoilPayload(const SensorDataSnapshot *snapshot,
   App_PackU16BE(payload + 6, snapshot->soil.vwc_pct_x10);
 }
 
+static void App_BuildScd41Payload(const SensorDataSnapshot *snapshot,
+                                  uint8_t *payload)
+{
+  /* SCD41 CO2 path: humidity is intentionally a whole percent byte. */
+  App_PackU16BE(payload, snapshot->scd41.co2_ppm);
+  App_PackU16BE(payload + 2,
+                (uint16_t)App_T2TemperatureToWire(
+                    snapshot->scd41.temperature_mdeg_c));
+  payload[4] = snapshot->scd41.humidity_pct;
+}
+
 static void App_BuildDiagnosticPayload(const SensorDataSnapshot *snapshot,
                                        uint8_t reset_reason_code,
                                        uint8_t *payload)
@@ -286,6 +475,80 @@ static void App_BuildMismatchPayload(const SensorDataSnapshot *snapshot,
 static void App_BuildErrorPayload(uint8_t error_code, uint8_t *payload)
 {
   payload[0] = error_code;
+}
+
+static bool App_BuildRotatingSensorPayload(const SensorDataSnapshot *snapshot,
+                                           uint8_t *payload,
+                                           AppTxFrame *frame)
+{
+  AppSensorFamily family = g_next_sensor_family;
+  uint8_t attempts;
+
+  if ((snapshot == NULL) || (payload == NULL) || (frame == NULL))
+  {
+    return false;
+  }
+
+  /* Sensor family rotation: multi-sensor systems send one complete family
+   * payload per uplink instead of packing combinations into an 11-byte frame. */
+  for (attempts = 0U; attempts < (uint8_t)APP_SENSOR_FAMILY_COUNT; ++attempts)
+  {
+    if (App_IsSensorFamilyAvailable(family, snapshot))
+    {
+      switch (family)
+      {
+      case APP_SENSOR_FAMILY_SHT4X:
+        /* Legacy SHT4x path: fPort 1 for normal data, fPort 11 when the
+         * two SHT temperature readings disagree. */
+        if (App_IsShtTemperatureMismatch(snapshot))
+        {
+          if (!App_SetTxFrame(frame, RM126X_FPORT_SENSOR_MISMATCH,
+                              APP_PAYLOAD_LEN_SHT_MISMATCH, true, family))
+          {
+            return false;
+          }
+          App_BuildMismatchPayload(snapshot, payload);
+        }
+        else
+        {
+          if (!App_SetTxFrame(frame, RM126X_FPORT_NORMAL,
+                              APP_PAYLOAD_LEN_SHT_NORMAL, true, family))
+          {
+            return false;
+          }
+          App_BuildNormalPayload(snapshot, payload);
+        }
+        return true;
+
+      case APP_SENSOR_FAMILY_SOIL:
+        if (!App_SetTxFrame(frame, RM126X_FPORT_SOIL, APP_PAYLOAD_LEN_SOIL,
+                            true, family))
+        {
+          return false;
+        }
+        App_BuildSoilPayload(snapshot, payload);
+        return true;
+
+      case APP_SENSOR_FAMILY_SCD41:
+        /* SCD41 CO2 path: standalone from SHT validation and fPort 11. */
+        if (!App_SetTxFrame(frame, RM126X_FPORT_CO2, APP_PAYLOAD_LEN_SCD41,
+                            true, family))
+        {
+          return false;
+        }
+        App_BuildScd41Payload(snapshot, payload);
+        return true;
+
+      case APP_SENSOR_FAMILY_AS7341:
+      default:
+        break;
+      }
+    }
+
+    family = App_NextSensorFamily(family);
+  }
+
+  return false;
 }
 
 static uint8_t App_SelectErrorCode(const SensorDataSnapshot *snapshot)
@@ -395,6 +658,7 @@ int main(void)
   SleepManager_Init(&hrtc, &hiwdg, &hi2c1);
   AppSafety_SetBootStage(APP_BOOT_STAGE_SLEEP_MANAGER_INITIALIZED);
   SensorData_Init(&hi2c1);
+  SensorData_SetDelayMsCallback(App_SensorDelayMs);
   RM126x_Init(&g_rm126x, &g_rm126x_config);
   (void)RM126x_HostUartResume(&g_rm126x);
   AppSafety_SetBootStage(APP_BOOT_STAGE_APPLICATION_READY);
@@ -415,82 +679,48 @@ int main(void)
 
     if (RM126x_IsConnected(&g_rm126x))
     {
-      uint8_t tx_payload[9] = {0};
-      size_t tx_length = 0U;
-      uint8_t tx_port = RM126X_FPORT_NORMAL;
+      uint8_t tx_payload[APP_TX_PAYLOAD_MAX_BYTES] = {0};
+      AppTxFrame tx_frame = {
+          .fport = RM126X_FPORT_ERROR,
+          .length = 0U,
+          .is_sensor_family = false,
+          .sensor_family = APP_SENSOR_FAMILY_SHT4X,
+      };
       bool force_diagnostic = RM126x_ShouldSendDiagnosticPort9(&g_rm126x);
       bool send_diagnostic;
       bool pulse_uplink_pending = g_pulse_uplink_pending;
       uint32_t pulse_count_snapshot = g_pulse_counter;
-      bool sensor1_valid;
-      bool sensor2_valid;
-      bool soil_valid;
       bool has_legacy_sensors;
-      int32_t temperature_delta;
 
       HAL_GPIO_WritePin(I2C_ENABLE_GPIO_Port, I2C_ENABLE_Pin, GPIO_PIN_SET);
       HAL_Delay(APP_SENSOR_POWER_UP_DELAY_MS);
       g_sensor_status = SensorData_ReadAll(&g_sensor_snapshot);
-      sensor1_valid = App_IsSensorValid(&g_sensor_snapshot.sensors[0]);
-      sensor2_valid = App_IsSensorValid(&g_sensor_snapshot.sensors[1]);
-      soil_valid = g_sensor_snapshot.soil.sample_valid;
       has_legacy_sensors = (g_sensor_snapshot.present_count > 0U);
       send_diagnostic = force_diagnostic && has_legacy_sensors;
 
-      // KEEP THIS CODE, BUT WE DON"T WANT TO IMPLEMENT IT TODAY, SO JUST
-      // COMMENT IT OUT TO AVOID UNNECESSARY COMPLEXITY IN THE APP LOGIC FOR
-      // NOW. WE CAN REVISIT THIS LATER. humidity_delta =
-      // g_sensor_snapshot.sensors[0].humidity_milli_pct_rh -
-      //                  g_sensor_snapshot.sensors[1].humidity_milli_pct_rh;
-      // if (humidity_delta < 0) {
-      //   humidity_delta = -humidity_delta;
-      // }
-      temperature_delta = g_sensor_snapshot.sensors[0].temperature_mdeg_c -
-                          g_sensor_snapshot.sensors[1].temperature_mdeg_c;
-      if (temperature_delta < 0)
-      {
-        temperature_delta = -temperature_delta;
-      }
-
       if (send_diagnostic)
       {
-        tx_port = RM126X_FPORT_DIAGNOSTIC;
-        tx_length = 9U;
+        (void)App_SetTxFrame(&tx_frame, RM126X_FPORT_DIAGNOSTIC,
+                             APP_PAYLOAD_LEN_DIAGNOSTIC, false,
+                             APP_SENSOR_FAMILY_SHT4X);
         App_BuildDiagnosticPayload(&g_sensor_snapshot, g_reset_reason_code,
                                    tx_payload);
       }
-      else if (soil_valid)
+      else if (!g_initial_send_pending && pulse_uplink_pending)
       {
-        tx_port = RM126X_FPORT_SOIL;
-        tx_length = 8U;
-        App_BuildSoilPayload(&g_sensor_snapshot, tx_payload);
+        (void)App_SetTxFrame(&tx_frame, RM126X_FPORT_PULSE_COUNT,
+                             APP_PAYLOAD_LEN_PULSE_COUNT, false,
+                             APP_SENSOR_FAMILY_SHT4X);
+        App_BuildPulseCountPayload(pulse_count_snapshot, tx_payload);
       }
-      else if (!sensor1_valid || !sensor2_valid ||
-               (g_sensor_status == SENSOR_DATA_STATUS_NO_SENSORS))
+      else if (!App_BuildRotatingSensorPayload(&g_sensor_snapshot, tx_payload,
+                                               &tx_frame))
       {
-        tx_port = RM126X_FPORT_ERROR;
-        tx_length = 1U;
+        (void)App_SetTxFrame(&tx_frame, RM126X_FPORT_ERROR,
+                             APP_PAYLOAD_LEN_ERROR, false,
+                             APP_SENSOR_FAMILY_SHT4X);
         App_BuildErrorPayload(App_SelectErrorCode(&g_sensor_snapshot),
                               tx_payload);
-      }
-      else if (temperature_delta > APP_SENSOR_TEMP_DELTA_LIMIT_MDEG_C)
-      {
-        tx_port = RM126X_FPORT_SENSOR_MISMATCH;
-        tx_length = 8U;
-        App_BuildMismatchPayload(&g_sensor_snapshot, tx_payload);
-      }
-      else
-      {
-        tx_port = RM126X_FPORT_NORMAL;
-        tx_length = 4U;
-        App_BuildNormalPayload(&g_sensor_snapshot, tx_payload);
-      }
-
-      if (!send_diagnostic && !g_initial_send_pending && pulse_uplink_pending)
-      {
-        tx_port = RM126X_FPORT_PULSE_COUNT;
-        tx_length = 4U;
-        App_BuildPulseCountPayload(pulse_count_snapshot, tx_payload);
       }
 
       HAL_GPIO_WritePin(I2C_ENABLE_GPIO_Port, I2C_ENABLE_Pin, GPIO_PIN_RESET);
@@ -498,20 +728,24 @@ int main(void)
 
       if (RM126x_WakeAndPing(&g_rm126x) == RM126X_RESULT_OK)
       {
-        if (g_rm126x.current_fport != tx_port)
+        if (g_rm126x.current_fport != tx_frame.fport)
         {
-          (void)RM126x_SetFPort(&g_rm126x, tx_port);
+          (void)RM126x_SetFPort(&g_rm126x, tx_frame.fport);
         }
 
-        if (g_rm126x.current_fport == tx_port)
+        if (g_rm126x.current_fport == tx_frame.fport)
         {
           RM126xResult send_result =
-              RM126x_SendBytes(&g_rm126x, tx_payload, tx_length);
+              RM126x_SendBytes(&g_rm126x, tx_payload, tx_frame.length);
           if (send_result == RM126X_RESULT_OK)
           {
-            if (tx_port == RM126X_FPORT_PULSE_COUNT)
+            if (tx_frame.fport == RM126X_FPORT_PULSE_COUNT)
             {
               g_pulse_uplink_pending = false;
+            }
+            if (tx_frame.is_sensor_family)
+            {
+              App_AdvanceSensorFamilyRotation(tx_frame.sensor_family);
             }
             g_initial_send_pending = false;
           }

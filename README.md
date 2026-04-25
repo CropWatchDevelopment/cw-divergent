@@ -180,11 +180,41 @@ function decodeUplink(input) {
       return { data, warnings, errors };
     }
 
-    // === Port 3: pulse counter (uint32) ===
-    // Layout: pulse_count(4 bytes, BE)
+    // === Port 3: SCD41 CO2 packet: CO2(2) + T(2) + RH whole %(1) ===
     if (input.fPort === 3) {
+      if (input.bytes.length < 5) {
+        errors.push("Payload too short on fPort 3 - expected 5 bytes");
+        return { data, warnings, errors };
+      }
+
+      var co2Ppm = (input.bytes[0] << 8) | input.bytes[1];
+      var scdTempRaw = (input.bytes[2] << 8) | input.bytes[3];
+      var scdHumidity = input.bytes[4] & 0xFF;
+
+      data = {
+        co2_ppm: co2Ppm,
+        temperature_c: +toTempC(scdTempRaw).toFixed(2),
+        humidity: scdHumidity,
+        received_at: input.received_at || null
+      };
+
+      if (data.co2_ppm < 0 || data.co2_ppm > 50000) {
+        warnings.push("CO2 out of SCD41 output range (0..50000 ppm)");
+      }
+      if (data.temperature_c < -10 || data.temperature_c > 60) {
+        warnings.push("SCD41 temperature out of operating range (-10..60°C)");
+      }
+      if (data.humidity > 100) {
+        warnings.push("Humidity > 100%");
+      }
+      return { data, warnings, errors };
+    }
+
+    // === Port 8: pulse counter (uint32) ===
+    // Layout: pulse_count(4 bytes, BE)
+    if (input.fPort === 8) {
       if (input.bytes.length < 4) {
-        errors.push("Payload too short on fPort 3 - expected 4 bytes");
+        errors.push("Payload too short on fPort 8 - expected 4 bytes");
         return { data, warnings, errors };
       }
 
